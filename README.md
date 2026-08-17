@@ -69,7 +69,7 @@ aside: Drafted a reply. Want to see it before I send?
 | `/effort` | pick thinking effort for the next message (inline buttons: off, minimal, low, medium, high, xhigh, ultrabrowse -- same levels as the aside browser) |
 | `/effort <level>` | set it directly without the button menu |
 | `/usage` | Claude subscription usage + context-window fill + cost |
-| `/new` | fresh persona-primed session (full access, native confirm off) |
+| `/new` | fresh persona-primed session after provider and transcript verification (full access, native confirm off) |
 | `/sessions` | list recent Aside sessions, tap a button to switch into one |
 
 ## The Mini App
@@ -147,14 +147,22 @@ Setup links a `bridgemon` command into `~/bin`. It manages both services:
 
 - `bridgemon status` -- bridge and Mini App together: running state, pid,
   port, tunnel URL, last error, last log lines.
+- `bridgemon doctor --json` -- bounded, non-secret evidence for repository,
+  source, installed paths, processes, endpoint health, and overall readiness.
 - `bridgemon watch` -- live timeline of everything the bridge and agent do,
   plus a one-key kill switch.
-- `bridgemon update` -- pull the latest version, syntax-check, restart, and
-  auto-rollback if anything looks broken. When the Mini App is installed it
-  is rebuilt (`npm install && npm run build`) and restarted too, with the
-  same snapshot-and-roll-back rule.
-- `bridgemon miniapp start|stop|restart|logs` -- the Mini App on its own.
-- `bridgemon logs` / `rollback` / `init` -- the rest.
+- `bridgemon update` -- fetch the current branch's configured upstream and
+  advance only by fast-forward, then syntax-check, restart, and health-check.
+  It refuses dirty tracked source, divergent history, and stale installed
+  Mini App paths. Mini App build artifacts retain their recoverable snapshot
+  behavior, but the command never copies a backup over tracked source.
+- `bridgemon miniapp migrate-paths` -- explicitly rebind a stale Mini App
+  plist and state directory to this checkout. It makes owner-only byte-exact
+  backups and restores both config and plist if reload or health fails.
+- `bridgemon miniapp start|stop|restart|logs` -- the other Mini App controls.
+- `bridgemon rollback` -- reports recovery material without overwriting source;
+  automatic source rollback stays disabled until immutable releases exist.
+- `bridgemon logs` / `init` -- the remaining operator commands.
 
 To stop everything: `bridgemon watch --kill` and `bridgemon miniapp stop`.
 
@@ -271,6 +279,12 @@ for you, but if you hand-edit `config.json` send `/new` to pick the
 change up. `default_effort` (default `high`) sets the thinking
 effort every normal turn runs at; use `/effort` in chat to bump a single
 upcoming turn to any level (off through ultrabrowse).
+
+Model names used by `/new` must resolve through the built-in provider-qualified
+map or a string entry in `config.json`'s `model_ids` object. A provider must
+also be connected in Aside. The bridge will not let Aside guess a provider,
+and it will not switch sessions until exactly one readable transcript proves
+the requested session started cleanly.
 
 </details>
 

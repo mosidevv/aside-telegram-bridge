@@ -2,10 +2,17 @@
 
 **Date:** 2026-08-17
 
-**Status:** Approved; implementation details amended after repository/API verification
+**Status:** Implementation complete; live acceptance and final audit pending
 
 **Orchestration:** Sol Advisor 0.6 `audit` route, native-first
 **Primary objective:** Restore a trustworthy local deployment and a truthful `/new` workflow without discarding the existing recovery state or expanding into the later durable-queue redesign.
+
+**Implementation checkpoint:** The static Phase 0 implementation now uses a
+single `aside_session.py` trust boundary, structured fail-closed deployment
+results, and one explicit recoverable Mini App path migration. Hermetic Python
+tests replace the prior live-state bridgemon test script. Acceptance criteria
+that require launchd, loopback health, model usage, security review, or the
+fresh Sol verdict remain evidence gates rather than implementation claims.
 
 ## 1. Context
 
