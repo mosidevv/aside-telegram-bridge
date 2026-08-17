@@ -8,6 +8,8 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 spec = importlib.util.spec_from_file_location(
     "bridgemod", os.path.join(HERE, "bridge.py"))
 b = importlib.util.module_from_spec(spec)
