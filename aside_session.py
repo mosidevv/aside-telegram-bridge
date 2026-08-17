@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Dict, FrozenSet, Mapping, Optional, Tuple
 
@@ -110,6 +111,10 @@ def _split_qualified_model(qualified_model: str):
         not isinstance(qualified_model, str)
         or qualified_model.count("/") != 1
         or any(character.isspace() for character in qualified_model)
+        or any(
+            unicodedata.category(character).startswith("C")
+            for character in qualified_model
+        )
     ):
         raise ModelResolutionError(
             "configuration",
@@ -201,7 +206,7 @@ def _session_directories(sessions_dir: str):
 
 def _record_contains(record, expected: str) -> bool:
     if isinstance(record, str):
-        return expected in record
+        return expected.casefold() in record.casefold()
     if isinstance(record, list):
         return any(_record_contains(value, expected) for value in record)
     if isinstance(record, dict):

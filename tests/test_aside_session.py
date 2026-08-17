@@ -116,6 +116,7 @@ class ModelQualificationTests(unittest.TestCase):
         for selected in (
             "openai-codex/gpt 5.6-sol",
             "openai-codex/family/gpt-5.6-sol",
+            "openai-codex/gpt-5.6-sol\x00",
         ):
             with self.subTest(selected=selected):
                 with self.assertRaises(self.module.ModelResolutionError):
@@ -227,6 +228,26 @@ class SessionCreationTests(unittest.TestCase):
         result = self.create(lambda _model: (0, "", ""))
         self.assertEqual(result.status, "created")
         self.assertEqual(result.session_id, "valid")
+
+    def test_session_marker_matching_is_case_insensitive(self):
+        self.marker = "permanent Telegram thread"
+
+        def execute(_model):
+            self.publish_valid_session("permanent telegram thread")
+            return 0, "", ""
+
+        result = self.create(execute)
+        self.assertEqual(result.status, "created")
+
+    def test_availability_phrase_matching_is_case_insensitive(self):
+        def execute(_model):
+            self.publish_error(
+                "Requested model Is Not Available For This Account."
+            )
+            return 0, "", ""
+
+        result = self.create(execute)
+        self.assertEqual(result.error_code, "availability")
 
     def test_transcript_provider_error_is_availability_rejection(self):
         def execute(_model):

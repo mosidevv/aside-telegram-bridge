@@ -366,14 +366,24 @@ def miniapp_status():
 
 
 def _source_valid():
-    if not os.path.isfile(BRIDGE_PY):
-        return False
-    try:
-        with open(BRIDGE_PY, "r", encoding="utf-8", errors="replace") as handle:
-            compile(handle.read(), BRIDGE_PY, "exec")
-    except (OSError, SyntaxError, ValueError):
-        return False
-    return True
+    return _compile_sources()[0]
+
+
+def _compile_sources():
+    for path in (
+        BRIDGE_PY,
+        os.path.join(BRIDGE_DIR, "aside_session.py"),
+    ):
+        if not os.path.isfile(path):
+            return False, "%s is missing" % os.path.basename(path)
+        try:
+            with open(
+                path, "r", encoding="utf-8", errors="replace"
+            ) as handle:
+                compile(handle.read(), path, "exec")
+        except (OSError, SyntaxError, ValueError) as exc:
+            return False, "%s: %s" % (os.path.basename(path), exc)
+    return True, ""
 
 
 def _installed_miniapp_paths_valid():
@@ -761,12 +771,7 @@ def cmd_help(_args):
 
 
 def _syntax_check():
-    try:
-        with open(BRIDGE_PY, "r", encoding="utf-8", errors="replace") as handle:
-            compile(handle.read(), BRIDGE_PY, "exec")
-        return True, ""
-    except (OSError, SyntaxError, ValueError) as e:
-        return False, str(e)
+    return _compile_sources()
 
 
 def _size(path):

@@ -435,6 +435,7 @@ class GitSyncTests(_BridgemonFixture):
 
     def test_failed_restart_never_overwrites_bridge_source(self):
         self.write(self.bm.BRIDGE_PY, "print('current')\n")
+        self.write(os.path.join(self.root, "aside_session.py"), "VALUE = 1\n")
         self.bm._git_sync = lambda: self.bm.GitSyncResult(
             status="skipped",
             changed=False,
@@ -464,6 +465,18 @@ class RollbackTests(_BridgemonFixture):
 
 
 class DeploymentHealthTests(_BridgemonFixture):
+    def test_source_valid_requires_session_boundary_to_compile(self):
+        self.write(self.bm.BRIDGE_PY, "print('safe')\n")
+        self.assertFalse(self.bm._source_valid())
+        self.assertFalse(self.bm._syntax_check()[0])
+
+        self.write(
+            os.path.join(self.root, "aside_session.py"),
+            "def broken(:\n",
+        )
+        self.assertFalse(self.bm._source_valid())
+        self.assertFalse(self.bm._syntax_check()[0])
+
     def test_health_keeps_process_endpoint_and_product_separate(self):
         health = self.bm.DeploymentHealth(
             source_valid=True,
@@ -506,6 +519,7 @@ class DeploymentHealthTests(_BridgemonFixture):
 
     def test_current_plist_paths_can_make_product_ready(self):
         self.write(self.bm.BRIDGE_PY, "print('safe')\n")
+        self.write(os.path.join(self.root, "aside_session.py"), "VALUE = 1\n")
         self.write_config({"state_dir": self.root, "port": 8790})
         node = self.write(os.path.join(self.root, "bin", "node"), "node\n")
         entry = self.write(
