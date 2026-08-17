@@ -394,6 +394,10 @@ Phase 0 does not make Telegram task delivery durable and does not enforce approv
 - Queued work and callbacks can still be affected by mutable global session state.
 - Telegram approval remains a prompt convention rather than a hard broker.
 - The Mini App retains the separately documented JWT URL, resource-limit, and public-admission risks.
+- A production-only `npm audit` on 2026-08-17 reports two pre-existing high
+  transitive advisories: `brace-expansion` denial of service and `fast-uri`
+  host confusion. Phase 0 did not change dependencies; lockfile remediation
+  and the resulting full TypeScript regression gate remain a separate wave.
 
 These limitations must remain visible in the final Phase 0 handoff. A healthy deployment and truthful `/new` workflow must not be described as complete product hardening.
 
