@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tokenize
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -377,9 +378,7 @@ def _compile_sources():
         if not os.path.isfile(path):
             return False, "%s is missing" % os.path.basename(path)
         try:
-            with open(
-                path, "r", encoding="utf-8", errors="replace"
-            ) as handle:
+            with tokenize.open(path) as handle:
                 compile(handle.read(), path, "exec")
         except (OSError, SyntaxError, ValueError) as exc:
             return False, "%s: %s" % (os.path.basename(path), exc)

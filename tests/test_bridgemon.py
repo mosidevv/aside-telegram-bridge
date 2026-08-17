@@ -477,6 +477,11 @@ class DeploymentHealthTests(_BridgemonFixture):
         self.assertFalse(self.bm._source_valid())
         self.assertFalse(self.bm._syntax_check()[0])
 
+        with open(os.path.join(self.root, "aside_session.py"), "wb") as handle:
+            handle.write(b"# invalid utf-8: \xff\nVALUE = 1\n")
+        self.assertFalse(self.bm._source_valid())
+        self.assertFalse(self.bm._syntax_check()[0])
+
     def test_health_keeps_process_endpoint_and_product_separate(self):
         health = self.bm.DeploymentHealth(
             source_valid=True,
