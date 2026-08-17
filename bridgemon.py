@@ -4,12 +4,10 @@
 Deploy tooling:
   bridgemon status          both services: launchd state, pid, port,
                              tunnel URL, last log lines
-  bridgemon update          git pull (if this is a repo clone), then
-                             syntax-check, restart, health-check, and
-                             keep or auto-rollback bridge.py. When the
-                             Mini App is installed it is rebuilt and
-                             restarted too, with the same rollback rule.
-  bridgemon rollback        force-restore the last known-good bridge.py
+  bridgemon doctor [--json] bounded source/install/process/endpoint evidence
+  bridgemon update          fast-forward the configured upstream, then
+                             syntax-check, restart, and health-check
+  bridgemon rollback        show recovery material without overwriting source
   bridgemon logs [n]        tail last n lines of bridge.log (default 30)
   bridgemon init            bless the current bridge.py as known-good
                              without restarting (first-time setup)
@@ -31,13 +29,15 @@ Exit codes: 0 success, 1 failure (update rolled back, or command error).
 """
 import json
 import os
-import py_compile
+import plistlib
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 #: The install being managed. Normally the directory this file sits in.
 #: `BRIDGEMON_DIR` points it elsewhere, which is what lets a checkout
@@ -56,6 +56,26 @@ MINIAPP_DIR = os.path.join(BRIDGE_DIR, "miniapp")
 MINIAPP_LABEL = "com.aside.miniapp"
 DEFAULT_CONFIG = os.path.join(BRIDGE_DIR, "config.json")
 DEFAULT_MINIAPP_PORT = 8790
+
+
+@dataclass(frozen=True)
+class GitSyncResult:
+    status: str
+    changed: bool
+    ok: bool
+    message: str
+    remote: Optional[str] = None
+    branch: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DeploymentHealth:
+    source_valid: bool
+    installed_paths_valid: bool
+    process_running: bool
+    endpoint_healthy: bool
+    product_ready: bool
+    reasons: Tuple[str, ...]
 
 
 def _uid():
@@ -345,6 +365,87 @@ def miniapp_status():
     }
 
 
+def _source_valid():
+    if not os.path.isfile(BRIDGE_PY):
+        return False
+    try:
+        with open(BRIDGE_PY, "r", encoding="utf-8", errors="replace") as handle:
+            compile(handle.read(), BRIDGE_PY, "exec")
+    except (OSError, SyntaxError, ValueError):
+        return False
+    return True
+
+
+def _installed_miniapp_paths_valid():
+    """Whether the installed plist points at this managed checkout."""
+
+    if not miniapp_installed():
+        return True
+    path = plist_path(MINIAPP_LABEL)
+    try:
+        with open(path, "rb") as handle:
+            plist = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    if not isinstance(plist, dict):
+        return False
+
+    arguments = plist.get("ProgramArguments")
+    environment = plist.get("EnvironmentVariables")
+    expected_entry = os.path.join(MINIAPP_DIR, "server", "dist", "index.js")
+    return bool(
+        isinstance(arguments, list)
+        and len(arguments) >= 2
+        and arguments[1] == expected_entry
+        and plist.get("WorkingDirectory") == MINIAPP_DIR
+        and isinstance(environment, dict)
+        and environment.get("MINIAPP_CONFIG") == config_path()
+    )
+
+
+def deployment_health():
+    """Combine independent source, install, process, and endpoint evidence."""
+
+    source_valid = _source_valid()
+    installed_paths_valid = _installed_miniapp_paths_valid()
+    bridge_running, _bridge_pid = is_running()
+    miniapp_present = miniapp_installed()
+    miniapp_running = True
+    endpoint_healthy = True
+    if miniapp_present:
+        loaded, pid = service_state(MINIAPP_LABEL)
+        miniapp_running = loaded and pid is not None
+        endpoint_healthy = miniapp_health(miniapp_port())
+
+    process_running = bridge_running and miniapp_running
+    reasons = []
+    if not source_valid:
+        reasons.append("bridge source is missing or invalid")
+    if not installed_paths_valid:
+        reasons.append("installed Mini App paths are stale")
+    if not bridge_running:
+        reasons.append("bridge process is not running")
+    if miniapp_present and not miniapp_running:
+        reasons.append("Mini App process is not running")
+    if miniapp_present and not endpoint_healthy:
+        reasons.append("Mini App endpoint is not healthy")
+
+    product_ready = bool(
+        source_valid
+        and installed_paths_valid
+        and process_running
+        and endpoint_healthy
+    )
+    return DeploymentHealth(
+        source_valid=source_valid,
+        installed_paths_valid=installed_paths_valid,
+        process_running=process_running,
+        endpoint_healthy=endpoint_healthy,
+        product_ready=product_ready,
+        reasons=tuple(reasons),
+    )
+
+
 def _npm():
     npm = shutil.which("npm")
     if npm:
@@ -520,6 +621,76 @@ def cmd_status(_args):
     return 0
 
 
+def _repository_diagnosis():
+    repository = {
+        "root": BRIDGE_DIR,
+        "revision": None,
+        "branch": None,
+        "upstream": None,
+        "dirty_tracked": [],
+    }
+    if not _is_git_repo():
+        return repository
+
+    revision = _git("rev-parse", "HEAD")
+    if revision.returncode == 0 and revision.stdout.strip():
+        repository["revision"] = revision.stdout.strip()
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    if branch.returncode == 0 and branch.stdout.strip() != "HEAD":
+        repository["branch"] = branch.stdout.strip() or None
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode == 0:
+        repository["dirty_tracked"] = [
+            line[3:] if len(line) > 3 else line
+            for line in dirty.stdout.splitlines()
+            if line.strip()
+        ]
+    try:
+        remote, upstream_branch = _git_upstream()
+        repository["upstream"] = "%s/%s" % (remote, upstream_branch)
+    except _GitUpstreamError:
+        pass
+    return repository
+
+
+def cmd_doctor(args):
+    """Emit bounded deployment evidence without configs, logs, or secrets."""
+
+    health = deployment_health()
+    bridge_running, _bridge_pid = is_running()
+    miniapp_present = miniapp_installed()
+    miniapp_running = False
+    miniapp_endpoint = False
+    if miniapp_present:
+        loaded, pid = service_state(MINIAPP_LABEL)
+        miniapp_running = loaded and pid is not None
+        miniapp_endpoint = miniapp_health(miniapp_port())
+
+    payload = {
+        "repository": _repository_diagnosis(),
+        "bridge": {
+            "source_valid": health.source_valid,
+            "last_good_exists": os.path.exists(LAST_GOOD),
+            "process_running": bridge_running,
+        },
+        "miniapp": {
+            "installed_paths_valid": health.installed_paths_valid,
+            "process_running": miniapp_running,
+            "endpoint_healthy": miniapp_endpoint,
+        },
+        "product_ready": health.product_ready,
+        "reasons": list(health.reasons),
+    }
+    if "--json" in args:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print("product ready: %s" % payload["product_ready"])
+        print("repository: %s" % payload["repository"]["root"])
+        for reason in payload["reasons"]:
+            print("  - %s" % reason)
+    return 0 if health.product_ready else 1
+
+
 def _int_arg(args, default):
     """First arg as an int, or the default. `bridgemon logs oops` used to
     die with a ValueError traceback."""
@@ -554,9 +725,10 @@ def cmd_help(_args):
 
 def _syntax_check():
     try:
-        py_compile.compile(BRIDGE_PY, doraise=True)
+        with open(BRIDGE_PY, "r", encoding="utf-8", errors="replace") as handle:
+            compile(handle.read(), BRIDGE_PY, "exec")
         return True, ""
-    except py_compile.PyCompileError as e:
+    except (OSError, SyntaxError, ValueError) as e:
         return False, str(e)
 
 
@@ -618,54 +790,165 @@ def _git(*args):
     )
 
 
-def _git_dirty():
-    """True if any *tracked* file has uncommitted changes (staged or
-    not). Ignores untracked files (config.json etc. are gitignored
-    anyway)."""
-    r = _git("status", "--porcelain", "--untracked-files=no")
-    return bool(r.stdout.strip())
+class _GitUpstreamError(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
-def _git_pull():
-    """Pull the tracked branch if this directory is a clone of the repo.
-    Returns (changed, message). Refuses to touch anything if there are
-    uncommitted local edits to tracked files -- a hard reset would
-    silently destroy them, which is worse than a stale update."""
+def _git_upstream():
+    """Return the current branch's configured ``(remote, branch)``."""
+
+    current = _git("rev-parse", "--abbrev-ref", "HEAD")
+    current_branch = current.stdout.strip() if current.returncode == 0 else ""
+    if not current_branch or current_branch == "HEAD":
+        raise _GitUpstreamError(
+            "blocked", "current checkout has no named branch"
+        )
+
+    remote_result = _git(
+        "config", "--get", "branch.%s.remote" % current_branch
+    )
+    merge_result = _git(
+        "config", "--get", "branch.%s.merge" % current_branch
+    )
+    remote = remote_result.stdout.strip() if remote_result.returncode == 0 else ""
+    merge_ref = merge_result.stdout.strip() if merge_result.returncode == 0 else ""
+    prefix = "refs/heads/"
+    if not remote or not merge_ref.startswith(prefix) or merge_ref == prefix:
+        raise _GitUpstreamError(
+            "blocked",
+            "current branch has no configured remote tracking branch",
+        )
+
+    remote_check = _git("remote", "get-url", remote)
+    if remote_check.returncode != 0 or not remote_check.stdout.strip():
+        raise _GitUpstreamError(
+            "failed", "configured Git remote could not be resolved"
+        )
+    return remote, merge_ref[len(prefix):]
+
+
+def _git_sync():
+    """Fast-forward from the configured upstream without destructive reset."""
+
     if not _is_git_repo():
-        return False, "not a git checkout, skipping pull (local-only mode)"
-    if _git_dirty():
-        return False, (
-            "uncommitted local changes to tracked files -- refusing to "
-            "pull (would discard them). commit or stash first, then "
-            "rerun update"
+        return GitSyncResult(
+            status="skipped",
+            changed=False,
+            ok=True,
+            message="not a Git checkout; local-only deployment was not synced",
         )
-    r = _git("rev-parse", "--abbrev-ref", "HEAD")
-    branch = r.stdout.strip() or "main"
-    before = _git("rev-parse", "HEAD").stdout.strip()
-    fetch = _git("fetch", "origin", branch)
+
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode != 0:
+        return GitSyncResult(
+            status="failed",
+            changed=False,
+            ok=False,
+            message="could not inspect tracked Git state",
+        )
+    if dirty.stdout.strip():
+        return GitSyncResult(
+            status="blocked",
+            changed=False,
+            ok=False,
+            message=(
+                "tracked files have uncommitted changes; commit or stash them "
+                "before update"
+            ),
+        )
+
+    try:
+        remote, branch = _git_upstream()
+    except _GitUpstreamError as exc:
+        return GitSyncResult(
+            status=exc.status,
+            changed=False,
+            ok=False,
+            message=exc.message,
+        )
+
+    before_result = _git("rev-parse", "HEAD")
+    before = before_result.stdout.strip() if before_result.returncode == 0 else ""
+    if not before:
+        return GitSyncResult(
+            status="failed",
+            changed=False,
+            ok=False,
+            message="could not resolve the local Git revision",
+            remote=remote,
+            branch=branch,
+        )
+
+    fetch = _git("fetch", remote, branch)
     if fetch.returncode != 0:
-        return False, "git fetch failed: %s" % fetch.stderr.strip()[:200]
-    target = "origin/%s" % branch
-    remote_head = _git("rev-parse", target).stdout.strip()
-    if before == remote_head:
-        return False, "already up to date (%s)" % before[:8]
-    # refuse a hard reset if it would discard real local commits --
-    # e.g. work committed here but not yet pushed. Only fast-forward
-    # (local HEAD must already be an ancestor of the remote branch).
-    ff_check = _git("merge-base", "--is-ancestor", "HEAD", target)
-    if ff_check.returncode != 0:
-        ahead = _git("rev-list", "--count",
-                     "%s..HEAD" % target).stdout.strip()
-        return False, (
-            "local HEAD has %s commit(s) not on %s -- refusing to "
-            "reset (would discard them). push your local commits "
-            "first, then rerun update" % (ahead or "some", target)
+        return GitSyncResult(
+            status="failed",
+            changed=False,
+            ok=False,
+            message="Git fetch failed for %s/%s" % (remote, branch),
+            remote=remote,
+            branch=branch,
         )
-    reset = _git("reset", "--hard", target)
-    if reset.returncode != 0:
-        return False, "git reset failed: %s" % reset.stderr.strip()[:200]
-    after = _git("rev-parse", "HEAD").stdout.strip()
-    return True, "pulled %s..%s" % (before[:8], after[:8])
+
+    target = "%s/%s" % (remote, branch)
+    target_result = _git("rev-parse", target)
+    remote_head = (
+        target_result.stdout.strip() if target_result.returncode == 0 else ""
+    )
+    if not remote_head:
+        return GitSyncResult(
+            status="failed",
+            changed=False,
+            ok=False,
+            message="could not resolve fetched upstream %s" % target,
+            remote=remote,
+            branch=branch,
+        )
+    if before == remote_head:
+        return GitSyncResult(
+            status="unchanged",
+            changed=False,
+            ok=True,
+            message="already up to date (%s)" % before[:8],
+            remote=remote,
+            branch=branch,
+        )
+
+    ancestor = _git("merge-base", "--is-ancestor", "HEAD", target)
+    if ancestor.returncode != 0:
+        return GitSyncResult(
+            status="blocked",
+            changed=False,
+            ok=False,
+            message=(
+                "local history is not a fast-forward of %s; update refused"
+                % target
+            ),
+            remote=remote,
+            branch=branch,
+        )
+
+    merge = _git("merge", "--ff-only", target)
+    if merge.returncode != 0:
+        return GitSyncResult(
+            status="failed",
+            changed=False,
+            ok=False,
+            message="fast-forward merge failed for %s" % target,
+            remote=remote,
+            branch=branch,
+        )
+    return GitSyncResult(
+        status="updated",
+        changed=True,
+        ok=True,
+        message="fast-forwarded %s..%s" % (before[:8], remote_head[:8]),
+        remote=remote,
+        branch=branch,
+    )
 
 
 def _update_miniapp(stamp):
@@ -710,12 +993,44 @@ def _update_miniapp(stamp):
     return False, "mini app unhealthy after restart and no snapshot to restore"
 
 
+def _recovery_locations():
+    locations = []
+    if os.path.exists(LAST_GOOD):
+        locations.append(LAST_GOOD)
+    try:
+        locations.extend(
+            os.path.join(BACKUP_DIR, name)
+            for name in sorted(os.listdir(BACKUP_DIR))
+            if name.startswith("phase0-")
+        )
+    except OSError:
+        pass
+    return locations
+
+
+def _print_recovery_locations():
+    locations = _recovery_locations()
+    if not locations:
+        print("no local recovery checkpoint was found")
+        return
+    print("recovery material was left unchanged:")
+    for path in locations:
+        print("  %s" % path)
+
+
 def cmd_update(_args):
-    pulled, pull_msg = _git_pull()
-    print(pull_msg)
+    sync = _git_sync()
+    print(sync.message)
+    if not sync.ok:
+        return 1
 
     if not os.path.exists(BRIDGE_PY):
         print("bridge.py not found")
+        return 1
+
+    if miniapp_installed() and not _installed_miniapp_paths_valid():
+        print("installed Mini App paths are stale; update stopped")
+        print("next step: bridgemon miniapp migrate-paths")
         return 1
 
     ok, err = _syntax_check()
@@ -723,42 +1038,17 @@ def cmd_update(_args):
         print("syntax check failed, not deploying:\n%s" % err)
         return 1
 
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    if not os.path.exists(LAST_GOOD):
-        # first run: nothing to roll back to yet, just bless + go
-        shutil.copy2(BRIDGE_PY, LAST_GOOD)
-
-    same_as_live = (
-        os.path.exists(LAST_GOOD)
-        and open(BRIDGE_PY, "rb").read() == open(LAST_GOOD, "rb").read()
-    )
-
     print("restarting bridge to apply update...")
     kickstart_restart()
     healthy, reason = _health_check()
 
     if not healthy:
-        print("update looked unhealthy (%s) -- rolling back" % reason)
-        shutil.copy2(LAST_GOOD, BRIDGE_PY)
-        kickstart_restart()
-        healthy2, reason2 = _health_check()
-        if healthy2:
-            print("rolled back to last known-good and confirmed healthy")
-        else:
-            print("rollback restart still unhealthy (%s) -- check logs "
-                  "and the launchd job by hand" % reason2)
-        # The bridge is the thing people text; a rolled-back bridge is a
-        # failed update whatever the mini app then did.
+        print("update is unhealthy (%s); source was not overwritten" % reason)
+        _print_recovery_locations()
         return 1
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    shutil.copy2(BRIDGE_PY, LAST_GOOD)
-    shutil.copy2(BRIDGE_PY, os.path.join(BACKUP_DIR, "bridge-%s.py" % ts))
-    _prune_backups()
-    if same_as_live:
-        print("bridge update applied and healthy (no code change detected)")
-    else:
-        print("bridge update applied and healthy. snapshot saved: %s" % ts)
+    print("bridge update applied and healthy")
 
     mini_ok, mini_msg = _update_miniapp(ts)
     print(mini_msg)
@@ -766,29 +1056,12 @@ def cmd_update(_args):
 
 
 def cmd_rollback(_args):
-    if not os.path.exists(LAST_GOOD):
-        print("no last-good backup on file, nothing to roll back to")
-        return 1
-    shutil.copy2(LAST_GOOD, BRIDGE_PY)
-    kickstart_restart()
-    healthy, reason = _health_check()
-    if healthy:
-        print("rolled back to last known-good and confirmed healthy")
-        return 0
-    print("rolled back but health check failed (%s), check logs" % reason)
-    return 1
-
-
-def _prune_backups(keep=10):
-    snaps = sorted(
-        f for f in os.listdir(BACKUP_DIR)
-        if f.startswith("bridge-") and f.endswith(".py")
+    print(
+        "automatic source rollback is disabled until immutable releases "
+        "exist; no files were changed"
     )
-    for f in snaps[:-keep]:
-        try:
-            os.remove(os.path.join(BACKUP_DIR, f))
-        except OSError:
-            pass
+    _print_recovery_locations()
+    return 1
 
 
 def cmd_watch(args):
@@ -803,6 +1076,7 @@ def cmd_watch(args):
 
 COMMANDS = {
     "status": cmd_status,
+    "doctor": cmd_doctor,
     "update": cmd_update,
     "rollback": cmd_rollback,
     "logs": cmd_logs,

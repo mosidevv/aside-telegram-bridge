@@ -1,11 +1,14 @@
 """Hermetic standard-library tests for bridgemon."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,7 +28,7 @@ class FakePrint:
         return result
 
 
-class BridgemonTestCase(unittest.TestCase):
+class _BridgemonFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="bridgemon-test-")
         self.root = self.tmp.name
@@ -77,6 +80,9 @@ class BridgemonTestCase(unittest.TestCase):
             self.write(os.path.join(self.agents, name + ".plist"))
         self.bm._LABEL_CACHE.clear()
         return self.bm._detect_label()
+
+
+class BridgemonTestCase(_BridgemonFixture):
 
     def test_tunnel_url_parsing(self):
         self.assertEqual(
@@ -211,10 +217,257 @@ class BridgemonTestCase(unittest.TestCase):
     def test_command_table_preserves_operator_commands(self):
         for name in (
             "status", "update", "rollback", "logs", "init", "watch",
-            "miniapp", "help", "--help", "-h",
+            "miniapp", "doctor", "help", "--help", "-h",
         ):
             with self.subTest(name=name):
                 self.assertIn(name, self.bm.COMMANDS)
+
+
+class FakeCompleted:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def ok(stdout=""):
+    return FakeCompleted(stdout=stdout)
+
+
+class GitFake:
+    def __init__(self, results):
+        self.results = results
+        self.calls = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.results.get(args, FakeCompleted(
+            returncode=99,
+            stderr="unexpected git call: %r" % (args,),
+        ))
+
+
+class GitSyncTests(_BridgemonFixture):
+    def git_repo(self):
+        os.makedirs(os.path.join(self.root, ".git"), exist_ok=True)
+
+    def configured(self, extra=None):
+        results = {
+            ("status", "--porcelain", "--untracked-files=no"): ok(""),
+            ("rev-parse", "--abbrev-ref", "HEAD"): ok("feature\n"),
+            ("config", "--get", "branch.feature.remote"): ok("fork\n"),
+            ("config", "--get", "branch.feature.merge"): ok(
+                "refs/heads/feature\n"
+            ),
+            ("remote", "get-url", "fork"): ok("git@example/fork.git\n"),
+            ("rev-parse", "HEAD"): ok("aaaa\n"),
+            ("fetch", "fork", "feature"): ok(""),
+            ("rev-parse", "fork/feature"): ok("bbbb\n"),
+            ("merge-base", "--is-ancestor", "HEAD", "fork/feature"): ok(""),
+            ("merge", "--ff-only", "fork/feature"): ok(""),
+        }
+        results.update(extra or {})
+        return GitFake(results)
+
+    def test_git_sync_uses_configured_fork_upstream(self):
+        self.git_repo()
+        fake = self.configured()
+        self.bm._git = fake
+
+        result = self.bm._git_sync()
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.changed)
+        self.assertEqual((result.remote, result.branch), ("fork", "feature"))
+        self.assertIn(("fetch", "fork", "feature"), fake.calls)
+        self.assertNotIn(("reset", "--hard", "fork/feature"), fake.calls)
+
+    def test_non_git_deployment_is_an_explicit_safe_skip(self):
+        result = self.bm._git_sync()
+        self.assertTrue(result.ok)
+        self.assertFalse(result.changed)
+        self.assertEqual(result.status, "skipped")
+
+    def test_git_sync_blocks_dirty_tracked_source(self):
+        self.git_repo()
+        fake = self.configured({
+            ("status", "--porcelain", "--untracked-files=no"): ok(
+                " M bridge.py\n"
+            ),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "blocked")
+        self.assertNotIn(("fetch", "fork", "feature"), fake.calls)
+
+    def test_git_sync_blocks_missing_upstream(self):
+        self.git_repo()
+        fake = self.configured({
+            ("config", "--get", "branch.feature.remote"): FakeCompleted(1),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "blocked")
+
+    def test_git_sync_fails_missing_remote(self):
+        self.git_repo()
+        fake = self.configured({
+            ("remote", "get-url", "fork"): FakeCompleted(2, stderr="missing"),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "failed")
+
+    def test_git_sync_fails_fetch(self):
+        self.git_repo()
+        fake = self.configured({
+            ("fetch", "fork", "feature"): FakeCompleted(1, stderr="offline"),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "failed")
+
+    def test_git_sync_blocks_non_fast_forward(self):
+        self.git_repo()
+        fake = self.configured({
+            ("merge-base", "--is-ancestor", "HEAD", "fork/feature"):
+                FakeCompleted(1),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "blocked")
+        self.assertNotIn(("merge", "--ff-only", "fork/feature"), fake.calls)
+
+    def test_git_sync_reports_already_current(self):
+        self.git_repo()
+        fake = self.configured({
+            ("rev-parse", "fork/feature"): ok("aaaa\n"),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertTrue(result.ok)
+        self.assertFalse(result.changed)
+        self.assertEqual(result.status, "unchanged")
+
+    def test_git_sync_fails_merge_without_reset(self):
+        self.git_repo()
+        fake = self.configured({
+            ("merge", "--ff-only", "fork/feature"):
+                FakeCompleted(1, stderr="merge failed"),
+        })
+        self.bm._git = fake
+        result = self.bm._git_sync()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "failed")
+        self.assertFalse(any(call[:2] == ("reset", "--hard")
+                             for call in fake.calls))
+
+    def test_update_stops_before_restart_when_git_sync_blocks(self):
+        self.write(self.bm.BRIDGE_PY, "print('safe')\n")
+        self.bm._git_sync = lambda: self.bm.GitSyncResult(
+            status="blocked",
+            changed=False,
+            ok=False,
+            message="dirty tracked source",
+        )
+        restarted = []
+        self.bm.kickstart_restart = lambda *_args: restarted.append(True)
+        self.assertEqual(self.bm.cmd_update([]), 1)
+        self.assertEqual(restarted, [])
+
+    def test_update_stops_before_stale_miniapp_restart(self):
+        self.write(self.bm.BRIDGE_PY, "print('safe')\n")
+        self.write_config({"state_dir": self.root, "port": 8790})
+        self.bm._git_sync = lambda: self.bm.GitSyncResult(
+            status="skipped",
+            changed=False,
+            ok=True,
+            message="local-only",
+        )
+        restarted = []
+        self.bm.kickstart_restart = lambda *_args: restarted.append(True)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = self.bm.cmd_update([])
+        self.assertEqual(code, 1)
+        self.assertEqual(restarted, [])
+        self.assertIn("bridgemon miniapp migrate-paths", stdout.getvalue())
+
+    def test_failed_restart_never_overwrites_bridge_source(self):
+        self.write(self.bm.BRIDGE_PY, "print('current')\n")
+        self.bm._git_sync = lambda: self.bm.GitSyncResult(
+            status="skipped",
+            changed=False,
+            ok=True,
+            message="local-only",
+        )
+        self.bm._health_check = lambda: (False, "no fresh start")
+        self.bm.kickstart_restart = lambda *_args: None
+        with mock.patch.object(self.bm.shutil, "copy2") as copy2:
+            code = self.bm.cmd_update([])
+        self.assertEqual(code, 1)
+        copy2.assert_not_called()
+        with open(self.bm.BRIDGE_PY, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "print('current')\n")
+
+
+class RollbackTests(_BridgemonFixture):
+    def test_rollback_never_copies_last_good_over_bridge(self):
+        self.write(self.bm.BRIDGE_PY, "current\n")
+        self.write(self.bm.LAST_GOOD, "old\n")
+        with mock.patch.object(self.bm.shutil, "copy2") as copy2:
+            code = self.bm.cmd_rollback([])
+        self.assertEqual(code, 1)
+        copy2.assert_not_called()
+        with open(self.bm.BRIDGE_PY, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "current\n")
+
+
+class DeploymentHealthTests(_BridgemonFixture):
+    def test_health_keeps_process_endpoint_and_product_separate(self):
+        health = self.bm.DeploymentHealth(
+            source_valid=True,
+            installed_paths_valid=False,
+            process_running=True,
+            endpoint_healthy=True,
+            product_ready=False,
+            reasons=("installed Mini App paths are stale",),
+        )
+        self.assertTrue(health.process_running)
+        self.assertTrue(health.endpoint_healthy)
+        self.assertFalse(health.product_ready)
+
+    def test_doctor_json_is_small_and_does_not_emit_secrets(self):
+        sentinel = "SECRET-TOKEN-DO-NOT-PRINT"
+        self.write(self.bm.BRIDGE_PY, "print('safe')\n")
+        self.write(self.bm.LAST_GOOD, "print('older')\n")
+        self.write_config({"state_dir": self.root, "port": 8790})
+        with open(self.bm.config_path(), encoding="utf-8") as handle:
+            config = json.load(handle)
+        config["token"] = sentinel
+        self.write(self.bm.config_path(), json.dumps(config))
+        self.bm.is_running = lambda *_args: (True, "42")
+        self.bm.service_state = lambda _label: (False, None)
+        self.bm.miniapp_health = lambda _port: False
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = self.bm.cmd_doctor(["--json"])
+
+        self.assertEqual(code, 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertNotIn(sentinel, stdout.getvalue())
+        self.assertEqual(
+            set(payload),
+            {"repository", "bridge", "miniapp", "product_ready", "reasons"},
+        )
+        self.assertNotIn("config", payload)
+        self.assertNotIn("environment", payload)
 
 
 if __name__ == "__main__":
