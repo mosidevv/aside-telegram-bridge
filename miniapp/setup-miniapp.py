@@ -361,20 +361,27 @@ def migrate_paths(
             backup_dir,
         )
 
-    restored = False
+    bytes_restored = False
+    service_restored = False
     try:
         _atomic_write_bytes(config_path, old_config_bytes)
         _atomic_write_bytes(plist_path, old_plist_bytes)
-        reload_service()
-        restored = True
+        bytes_restored = True
+        service_restored = bool(reload_service())
     except Exception:  # noqa: BLE001 - result reports failed restoration
-        restored = False
+        pass
+    restored = bytes_restored and service_restored
+    if restored:
+        restoration_message = "original files and service restored"
+    elif bytes_restored:
+        restoration_message = "original files restored; service reload failed"
+    else:
+        restoration_message = "original files could not be fully restored"
     return MigrationResult(
         False,
         True,
         restored,
-        "%s; original files %s"
-        % (failure, "restored" if restored else "could not be fully restored"),
+        "%s; %s" % (failure, restoration_message),
         backup_dir,
     )
 

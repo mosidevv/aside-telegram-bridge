@@ -219,6 +219,37 @@ class SessionCreationTests(unittest.TestCase):
         result = self.create(lambda _model: (0, "", ""), timeout_seconds=1.0)
         self.assertNotEqual(result.status, "created")
 
+    def test_prompt_only_transcript_is_not_a_usable_session(self):
+        def execute(_model):
+            self.write_transcript([{
+                "role": "user",
+                "content": [{"type": "text", "text": self.marker}],
+            }])
+            return 0, "", ""
+
+        result = self.create(execute, timeout_seconds=1.0)
+        self.assertNotEqual(result.status, "created")
+        self.assertEqual(result.error_code, "session")
+
+    def test_nonterminal_assistant_record_is_not_a_usable_session(self):
+        def execute(_model):
+            self.write_transcript([
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": self.marker}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [],
+                    "stopReason": "tool_use",
+                },
+            ])
+            return 0, "", ""
+
+        result = self.create(execute, timeout_seconds=1.0)
+        self.assertNotEqual(result.status, "created")
+        self.assertEqual(result.error_code, "session")
+
     def test_valid_session_after_more_than_one_second_is_created(self):
         def publish(now):
             if now >= 1.5 and not os.path.exists(self.session_dir):
@@ -266,6 +297,17 @@ class SessionCreationTests(unittest.TestCase):
         result = self.create(lambda _model: (1, "", "safe process failure"))
         self.assertEqual(result.error_code, "process")
         self.assertNotIn("couldn't find its id", result.user_message)
+
+    def test_stderr_availability_error_is_safely_classified(self):
+        secret_output = (
+            "Requested model is not available for this account. "
+            "SECRET-OUTPUT-DO-NOT-RETURN"
+        )
+        result = self.create(lambda _model: (0, "", secret_output))
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(result.error_code, "availability")
+        self.assertNotIn(secret_output, result.diagnostic)
+        self.assertNotIn("SECRET-OUTPUT", result.user_message)
 
     def test_execute_receives_only_qualified_model(self):
         received = []
@@ -410,11 +452,22 @@ class BridgeSessionIntegrationTests(unittest.TestCase):
             "bridge_phase0_test", bridge_path
         )
         bridge = importlib.util.module_from_spec(spec)
+        real_open = open
+        account_reads = []
+
+        def guarded_open(path, *args, **kwargs):
+            rendered = os.path.abspath(os.path.expanduser(os.fspath(path)))
+            if rendered.endswith(os.path.join(".aside", "accounts.json")):
+                account_reads.append(rendered)
+                raise AssertionError("explicit config must not read Aside accounts")
+            return real_open(path, *args, **kwargs)
+
         with mock.patch.dict(os.environ, {
             "ASIDE_BRIDGE_DIR": self.tmp.name,
             "ASIDE_BRIDGE_CONFIG": self.config,
-        }):
+        }), mock.patch("builtins.open", side_effect=guarded_open):
             spec.loader.exec_module(bridge)
+        self.assertEqual(account_reads, [])
         self.assertEqual(
             bridge.BRIDGE_DIR,
             self.tmp.name,

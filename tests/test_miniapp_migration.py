@@ -169,6 +169,22 @@ class MiniappAtomicMigrationTests(MiniappMigrationFixture):
         self.assertEqual(self.read_bytes(self.config_path), old_config)
         self.assertEqual(self.read_bytes(self.plist_path), old_plist)
 
+    def test_failed_restoration_reload_is_not_reported_as_restored(self):
+        old_config, old_plist = self.seed()
+        reloads = []
+
+        def reload_service():
+            reloads.append(True)
+            return False
+
+        result = self.migrate(reload_service=reload_service)
+        self.assertFalse(result.ok)
+        self.assertFalse(result.restored)
+        self.assertEqual(reloads, [True, True])
+        self.assertIn("service reload failed", result.message)
+        self.assertEqual(self.read_bytes(self.config_path), old_config)
+        self.assertEqual(self.read_bytes(self.plist_path), old_plist)
+
     def test_malformed_config_fails_before_reload(self):
         self.write_bytes(self.config_path, b"not-json\n")
         self.write_bytes(self.plist_path, plistlib.dumps({"Label": "old"}))

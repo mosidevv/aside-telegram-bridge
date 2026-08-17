@@ -402,7 +402,8 @@ def _installed_miniapp_paths_valid():
     arguments = plist.get("ProgramArguments")
     environment = plist.get("EnvironmentVariables")
     expected_entry = os.path.join(MINIAPP_DIR, "server", "dist", "index.js")
-    state_dir = miniapp_state_dir()
+    state_dir = os.path.abspath(miniapp_state_dir())
+    expected_state_dir = os.path.abspath(BRIDGE_DIR)
     return bool(
         isinstance(arguments, list)
         and len(arguments) >= 2
@@ -410,6 +411,8 @@ def _installed_miniapp_paths_valid():
         and os.path.isabs(arguments[0])
         and os.path.isfile(arguments[0])
         and arguments[1] == expected_entry
+        and os.path.isfile(expected_entry)
+        and state_dir == expected_state_dir
         and plist.get("WorkingDirectory") == MINIAPP_DIR
         and plist.get("StandardOutPath")
         == os.path.join(state_dir, "miniapp.out.log")

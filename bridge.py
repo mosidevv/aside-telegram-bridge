@@ -314,7 +314,10 @@ def config_path(key, fallback):
     """Resolve a configured path, treating an empty value as unspecified."""
 
     raw = str(CONFIG.get(key) or "").strip()
-    return os.path.expanduser(raw or fallback)
+    if raw:
+        return os.path.expanduser(raw)
+    resolved_fallback = fallback() if callable(fallback) else fallback
+    return os.path.expanduser(resolved_fallback)
 
 
 TOKEN = CONFIG["token"]
@@ -322,7 +325,7 @@ CHAT_ID = CONFIG["chat_id"]
 API = "https://api.telegram.org/bot%s/" % TOKEN
 OWNER = CONFIG.get("owner_name", "the user")
 SESSIONS_DIR = config_path(
-    "sessions_dir", os.path.join(detect_aside_root(), "sessions"))
+    "sessions_dir", lambda: os.path.join(detect_aside_root(), "sessions"))
 ASIDE_CLI = config_path(
     "aside_cli", "~/.aside/cli/Aside CLI.app/Contents/MacOS/aside")
 EXEC_TIMEOUT = int(CONFIG.get("exec_timeout_seconds", 1200))
@@ -652,7 +655,7 @@ CONTEXT_WINDOWS = merged_map("context_windows", {
 })
 CREDENTIALS_PATH = config_path(
     "credentials_path",
-    os.path.join(detect_aside_root(), "credentials.json"))
+    lambda: os.path.join(detect_aside_root(), "credentials.json"))
 
 
 def resolve_configured_model(selection):

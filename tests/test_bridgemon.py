@@ -553,6 +553,47 @@ class DeploymentHealthTests(_BridgemonFixture):
         self.assertTrue(health.installed_paths_valid)
         self.assertTrue(health.product_ready)
 
+    def test_stale_but_self_consistent_state_paths_are_invalid(self):
+        self.write_config({"state_dir": "/obsolete/checkout", "port": 8790})
+        node = self.write(os.path.join(self.root, "bin", "node"), "node\n")
+        entry = self.write(
+            os.path.join(
+                self.bm.MINIAPP_DIR, "server", "dist", "index.js"
+            ),
+            "// built\n",
+        )
+        plist = {
+            "ProgramArguments": [node, entry],
+            "WorkingDirectory": self.bm.MINIAPP_DIR,
+            "StandardOutPath": "/obsolete/checkout/miniapp.out.log",
+            "StandardErrorPath": "/obsolete/checkout/miniapp.err.log",
+            "EnvironmentVariables": {"MINIAPP_CONFIG": self.bm.config_path()},
+        }
+        path = self.bm.plist_path(self.bm.MINIAPP_LABEL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            plistlib.dump(plist, handle)
+        self.assertFalse(self.bm._installed_miniapp_paths_valid())
+
+    def test_missing_dist_entry_makes_installed_paths_invalid(self):
+        self.write_config({"state_dir": self.root, "port": 8790})
+        node = self.write(os.path.join(self.root, "bin", "node"), "node\n")
+        missing_entry = os.path.join(
+            self.bm.MINIAPP_DIR, "server", "dist", "index.js"
+        )
+        plist = {
+            "ProgramArguments": [node, missing_entry],
+            "WorkingDirectory": self.bm.MINIAPP_DIR,
+            "StandardOutPath": os.path.join(self.root, "miniapp.out.log"),
+            "StandardErrorPath": os.path.join(self.root, "miniapp.err.log"),
+            "EnvironmentVariables": {"MINIAPP_CONFIG": self.bm.config_path()},
+        }
+        path = self.bm.plist_path(self.bm.MINIAPP_LABEL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            plistlib.dump(plist, handle)
+        self.assertFalse(self.bm._installed_miniapp_paths_valid())
+
 
 if __name__ == "__main__":
     unittest.main()

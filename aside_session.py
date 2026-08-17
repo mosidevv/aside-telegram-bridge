@@ -230,6 +230,17 @@ def _assistant_error(record) -> Tuple[bool, bool]:
     return True, unavailable
 
 
+def _assistant_completed(record) -> bool:
+    if not isinstance(record, dict):
+        return False
+    message = record.get("message")
+    candidate = message if isinstance(message, dict) else record
+    return bool(
+        candidate.get("role") == "assistant"
+        and candidate.get("stopReason") == "end_turn"
+    )
+
+
 def _inspect_transcript(path: str, marker: str):
     """Return ``(state, availability_error)`` without returning transcript data."""
 
@@ -263,7 +274,22 @@ def _inspect_transcript(path: str, marker: str):
         is_error, unavailable = _assistant_error(record)
         if is_error:
             return "error", unavailable
-    return "valid", False
+    if any(_assistant_completed(record) for record in parsed):
+        return "valid", False
+    return "pending", False
+
+
+def _process_reports_unavailable(stdout: str, stderr: str) -> bool:
+    phrase = "is not available for this account"
+    for output in (stdout, stderr):
+        if not isinstance(output, str):
+            continue
+        bounded = output[:4096]
+        if len(output) > 4096:
+            bounded += output[-4096:]
+        if phrase in bounded.casefold():
+            return True
+    return False
 
 
 def create_new_session(
@@ -284,7 +310,7 @@ def create_new_session(
     before = _session_directories(sessions_dir)
 
     try:
-        returncode, _stdout, _stderr = execute(resolved.qualified_model)
+        returncode, stdout, stderr = execute(resolved.qualified_model)
     except Exception as exc:  # noqa: BLE001 - convert process boundary failures
         return _session_result(
             resolved,
@@ -293,6 +319,16 @@ def create_new_session(
             None,
             "Aside could not start the requested session.",
             "Session process raised {}.".format(type(exc).__name__),
+        )
+
+    if _process_reports_unavailable(stdout, stderr):
+        return _session_result(
+            resolved,
+            "rejected",
+            "availability",
+            None,
+            "The selected model is not available for this Aside account.",
+            "The session process reported model unavailability.",
         )
 
     if returncode != 0:
