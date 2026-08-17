@@ -10,15 +10,19 @@ binary included -- is fetched by the server itself at runtime.
 Idempotent: safe to re-run any time to reconfigure. This never touches
 setup.py, install.sh, or the running bridge.
 """
+import argparse
 import json
 import os
 import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from typing import Optional
 
 MINIAPP_DIR = os.path.dirname(os.path.realpath(__file__))
 BRIDGE_DIR = os.path.dirname(MINIAPP_DIR)
@@ -41,6 +45,15 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 RESET = "\033[0m"
+
+
+@dataclass(frozen=True)
+class MigrationResult:
+    ok: bool
+    changed: bool
+    restored: bool
+    message: str
+    backup_dir: Optional[str]
 
 
 def say(msg=""):
@@ -163,17 +176,207 @@ def load_config(path):
         return json.load(fh)
 
 
-def write_config(path, config):
-    """Rewrite the config in place, preserving permissions."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(config, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+def desired_miniapp_section(config_path, current_section, repository_root):
+    """Preserve Mini App choices while rebinding state to this checkout."""
+
+    del config_path  # Kept in the public builder signature for symmetry.
+    section = dict(current_section) if isinstance(current_section, dict) else {}
+    section["state_dir"] = os.path.abspath(repository_root)
+    return section
+
+
+def build_service_plist(config_path, section, repository_root, node_path):
+    """Build the complete launchd plist without reading config secrets."""
+
+    repository_root = os.path.abspath(repository_root)
+    config_path = os.path.abspath(config_path)
+    miniapp_dir = os.path.join(repository_root, "miniapp")
+    state_dir = os.path.expanduser(
+        str(section.get("state_dir") or repository_root)
+    )
+    return {
+        "Label": LABEL,
+        "ProgramArguments": [
+            node_path,
+            os.path.join(miniapp_dir, "server", "dist", "index.js"),
+        ],
+        "EnvironmentVariables": {
+            "MINIAPP_CONFIG": config_path,
+            "MINIAPP_PORT": str(section.get("port", DEFAULT_PORT)),
+            "PATH": (
+                "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:"
+                "/usr/sbin:/sbin"
+            ),
+        },
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": os.path.join(state_dir, "miniapp.out.log"),
+        "StandardErrorPath": os.path.join(state_dir, "miniapp.err.log"),
+        "WorkingDirectory": miniapp_dir,
+    }
+
+
+def _atomic_write_bytes(path, value, mode=0o600):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".%s." % os.path.basename(path),
+        dir=parent,
+    )
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, mode)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path, value, mode=0o600):
+    encoded = (json.dumps(value, indent=2) + "\n").encode("utf-8")
+    _atomic_write_bytes(path, encoded, mode=mode)
+
+
+def atomic_write_plist(path, value, mode=0o600):
+    _atomic_write_bytes(path, plistlib.dumps(value), mode=mode)
+
+
+def write_config(path, config):
+    """Atomically rewrite owner-only bridge configuration."""
+
+    atomic_write_json(path, config)
+
+
+def migrate_paths(
+    config_path,
+    plist_path,
+    repository_root,
+    node_path,
+    reload_service,
+    check_health,
+    backup_root,
+):
+    """Atomically rebind installed paths and restore exact bytes on failure."""
+
+    config_path = os.path.abspath(os.path.expanduser(config_path))
+    plist_path = os.path.abspath(os.path.expanduser(plist_path))
+    repository_root = os.path.abspath(os.path.expanduser(repository_root))
+    node_path = os.path.abspath(os.path.expanduser(node_path))
+    backup_root = os.path.abspath(os.path.expanduser(backup_root))
+    entry = os.path.join(
+        repository_root, "miniapp", "server", "dist", "index.js"
+    )
+
+    if not os.path.isfile(node_path) or not os.access(node_path, os.X_OK):
+        return MigrationResult(
+            False, False, False, "Node executable is missing", None
+        )
+    if not os.path.isfile(entry):
+        return MigrationResult(
+            False, False, False, "Mini App build output is missing", None
+        )
+
+    try:
+        with open(config_path, "rb") as handle:
+            old_config_bytes = handle.read()
+        config = json.loads(old_config_bytes.decode("utf-8"))
+        with open(plist_path, "rb") as handle:
+            old_plist_bytes = handle.read()
+        old_plist = plistlib.loads(old_plist_bytes)
+    except (OSError, UnicodeError, ValueError, plistlib.InvalidFileException):
+        return MigrationResult(
+            False,
+            False,
+            False,
+            "Existing config or plist is missing or malformed",
+            None,
+        )
+    if not isinstance(config, dict) or not isinstance(old_plist, dict):
+        return MigrationResult(
+            False,
+            False,
+            False,
+            "Existing config or plist has the wrong top-level type",
+            None,
+        )
+
+    current_section = config.get("miniapp")
+    if current_section is not None and not isinstance(current_section, dict):
+        return MigrationResult(
+            False, False, False, "Mini App config section is malformed", None
+        )
+    desired_section = desired_miniapp_section(
+        config_path, current_section or {}, repository_root
+    )
+    desired_config = dict(config)
+    desired_config["miniapp"] = desired_section
+    desired_plist = build_service_plist(
+        config_path, desired_section, repository_root, node_path
+    )
+
+    if desired_config == config and desired_plist == old_plist:
+        return MigrationResult(
+            True, False, False, "Mini App paths are already current", None
+        )
+
+    os.makedirs(backup_root, mode=0o700, exist_ok=True)
+    os.chmod(backup_root, 0o700)
+    backup_dir = tempfile.mkdtemp(prefix="miniapp-paths-", dir=backup_root)
+    os.chmod(backup_dir, 0o700)
+    _atomic_write_bytes(
+        os.path.join(backup_dir, "config.json.original"), old_config_bytes
+    )
+    _atomic_write_bytes(
+        os.path.join(backup_dir, "service.plist.original"), old_plist_bytes
+    )
+
+    failure = None
+    try:
+        atomic_write_json(config_path, desired_config)
+        atomic_write_plist(plist_path, desired_plist)
+        if not reload_service():
+            failure = "service reload failed"
+        elif not check_health(int(desired_section.get("port", DEFAULT_PORT))):
+            failure = "health check failed"
+    except Exception as exc:  # noqa: BLE001 - restore across I/O boundaries
+        failure = "migration write failed: %s" % type(exc).__name__
+
+    if failure is None:
+        return MigrationResult(
+            True,
+            True,
+            False,
+            "Mini App paths migrated and health verified",
+            backup_dir,
+        )
+
+    restored = False
+    try:
+        _atomic_write_bytes(config_path, old_config_bytes)
+        _atomic_write_bytes(plist_path, old_plist_bytes)
+        reload_service()
+        restored = True
+    except Exception:  # noqa: BLE001 - result reports failed restoration
+        restored = False
+    return MigrationResult(
+        False,
+        True,
+        restored,
+        "%s; original files %s"
+        % (failure, "restored" if restored else "could not be fully restored"),
+        backup_dir,
+    )
 
 
 def configure(config_path):
@@ -246,7 +449,7 @@ def configure(config_path):
         section["cloudflared_path"] = cloudflared_path
     else:
         section.pop("cloudflared_path", None)
-    section.setdefault("state_dir", os.path.dirname(config_path))
+    section = desired_miniapp_section(config_path, section, BRIDGE_DIR)
     config["miniapp"] = section
     write_config(config_path, config)
 
@@ -261,57 +464,39 @@ def configure(config_path):
 # --- step 4: launchd -----------------------------------------------------
 
 
+def reload_launchd_service(plist_path=PLIST_PATH):
+    """Reload the Mini App service without modifying its plist."""
+
+    uid = os.getuid()
+    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, LABEL)],
+                   capture_output=True)
+    proc = subprocess.run(
+        ["launchctl", "bootstrap", "gui/%d" % uid, plist_path],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        proc = subprocess.run(["launchctl", "load", "-w", plist_path],
+                              capture_output=True, text=True)
+    return proc.returncode == 0
+
+
 def install_service(config_path, section):
     node = shutil.which("node")
-    entry = os.path.join(MINIAPP_DIR, "server", "dist", "index.js")
+    if not node:
+        fail("Node executable is missing")
+        sys.exit(1)
+    plist = build_service_plist(config_path, section, BRIDGE_DIR, node)
+    entry = plist["ProgramArguments"][1]
     if not os.path.exists(entry):
         fail("build output missing at %s" % entry)
         sys.exit(1)
 
-    state_dir = section.get("state_dir") or os.path.dirname(config_path)
-    out_log = os.path.join(state_dir, "miniapp.out.log")
-    err_log = os.path.join(state_dir, "miniapp.err.log")
-
-    plist = {
-        "Label": LABEL,
-        "ProgramArguments": [node, entry],
-        "EnvironmentVariables": {
-            "MINIAPP_CONFIG": config_path,
-            "MINIAPP_PORT": str(section.get("port", DEFAULT_PORT)),
-            # launchd starts with a minimal PATH; the server shells out to
-            # the aside CLI and to tar for the cloudflared tarball.
-            "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        },
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "ThrottleInterval": 10,
-        "StandardOutPath": out_log,
-        "StandardErrorPath": err_log,
-        "WorkingDirectory": MINIAPP_DIR,
-    }
-
-    os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
-    with open(PLIST_PATH, "wb") as fh:
-        plistlib.dump(plist, fh)
+    atomic_write_plist(PLIST_PATH, plist)
     ok("wrote %s" % PLIST_PATH)
-
-    uid = os.getuid()
-    # bootout first so a re-run reloads rather than colliding with itself.
-    subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, LABEL)],
-                   capture_output=True)
-    proc = subprocess.run(
-        ["launchctl", "bootstrap", "gui/%d" % uid, PLIST_PATH],
-        capture_output=True, text=True)
-    if proc.returncode != 0:
-        # Older macOS wants load -w.
-        proc = subprocess.run(["launchctl", "load", "-w", PLIST_PATH],
-                              capture_output=True, text=True)
-    if proc.returncode != 0:
+    if not reload_launchd_service(PLIST_PATH):
         fail("launchctl could not start the service")
-        say((proc.stderr or "").strip())
         sys.exit(1)
     ok("service loaded (%s)" % LABEL)
-    return out_log, err_log
+    return plist["StandardOutPath"], plist["StandardErrorPath"]
 
 
 # --- step 5: health ------------------------------------------------------
@@ -354,7 +539,37 @@ def find_tunnel_url(log_paths, attempts=30):
 # --- main ----------------------------------------------------------------
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--migrate-paths", action="store_true")
+    parser.add_argument("--config")
+    parser.add_argument("--repository-root")
+    args = parser.parse_args(argv)
+
+    if args.migrate_paths:
+        if not args.config or not args.repository_root:
+            parser.error("--migrate-paths requires --config and --repository-root")
+        node = shutil.which("node") or ""
+        result = migrate_paths(
+            config_path=args.config,
+            plist_path=PLIST_PATH,
+            repository_root=args.repository_root,
+            node_path=node,
+            reload_service=lambda: reload_launchd_service(PLIST_PATH),
+            check_health=health_check,
+            backup_root=os.path.join(args.repository_root, "backups"),
+        )
+        print(
+            "%s: %s%s"
+            % (
+                "ok" if result.ok else "failed",
+                result.message,
+                "; backup=%s" % result.backup_dir
+                if result.backup_dir else "",
+            )
+        )
+        return 0 if result.ok else 1
+
     say("%s\n  Aside Telegram Mini App -- setup\n%s" % (BOLD, RESET))
     total = 5
 
@@ -453,7 +668,8 @@ def main():
     say("  %srestart: launchctl kickstart -k gui/%d/%s%s"
         % (DIM, os.getuid(), LABEL, RESET))
     say()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

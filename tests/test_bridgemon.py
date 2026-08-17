@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 import shutil
 import tempfile
 import unittest
@@ -195,6 +196,40 @@ class BridgemonTestCase(_BridgemonFixture):
         self.write_config(None)
         os.makedirs(self.bm.MINIAPP_DIR, exist_ok=True)
         self.assertTrue(self.bm.miniapp_installed())
+
+    def test_miniapp_path_migration_invokes_exact_noninteractive_command(self):
+        self.write_config({"port": 8790, "state_dir": "/stale"})
+        entry = os.path.join(
+            self.bm.MINIAPP_DIR, "server", "dist", "index.js"
+        )
+        self.write(entry, "// built\n")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return FakeCompleted(
+                returncode=7,
+                stdout="failed: health check failed; original files restored\n",
+            )
+
+        self.bm.subprocess.run = fake_run
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = self.bm.cmd_miniapp(["migrate-paths"])
+
+        self.assertEqual(code, 7)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], [
+            "/usr/bin/python3",
+            os.path.join(self.bm.MINIAPP_DIR, "setup-miniapp.py"),
+            "--migrate-paths",
+            "--config",
+            self.bm.config_path(),
+            "--repository-root",
+            self.root,
+        ])
+        self.assertIn("before migration", stdout.getvalue())
+        self.assertIn("after migration", stdout.getvalue())
 
     def test_dist_snapshot_and_restore(self):
         server_dist = os.path.join(self.bm.MINIAPP_DIR, "server", "dist")
@@ -468,6 +503,36 @@ class DeploymentHealthTests(_BridgemonFixture):
         )
         self.assertNotIn("config", payload)
         self.assertNotIn("environment", payload)
+
+    def test_current_plist_paths_can_make_product_ready(self):
+        self.write(self.bm.BRIDGE_PY, "print('safe')\n")
+        self.write_config({"state_dir": self.root, "port": 8790})
+        node = self.write(os.path.join(self.root, "bin", "node"), "node\n")
+        entry = self.write(
+            os.path.join(
+                self.bm.MINIAPP_DIR, "server", "dist", "index.js"
+            ),
+            "// built\n",
+        )
+        plist = {
+            "ProgramArguments": [node, entry],
+            "WorkingDirectory": self.bm.MINIAPP_DIR,
+            "StandardOutPath": os.path.join(self.root, "miniapp.out.log"),
+            "StandardErrorPath": os.path.join(self.root, "miniapp.err.log"),
+            "EnvironmentVariables": {"MINIAPP_CONFIG": self.bm.config_path()},
+        }
+        path = self.bm.plist_path(self.bm.MINIAPP_LABEL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            plistlib.dump(plist, handle)
+        self.bm.is_running = lambda *_args: (True, "41")
+        self.bm.service_state = lambda _label: (True, "42")
+        self.bm.miniapp_health = lambda _port: True
+
+        health = self.bm.deployment_health()
+
+        self.assertTrue(health.installed_paths_valid)
+        self.assertTrue(health.product_ready)
 
 
 if __name__ == "__main__":

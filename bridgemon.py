@@ -393,11 +393,19 @@ def _installed_miniapp_paths_valid():
     arguments = plist.get("ProgramArguments")
     environment = plist.get("EnvironmentVariables")
     expected_entry = os.path.join(MINIAPP_DIR, "server", "dist", "index.js")
+    state_dir = miniapp_state_dir()
     return bool(
         isinstance(arguments, list)
         and len(arguments) >= 2
+        and isinstance(arguments[0], str)
+        and os.path.isabs(arguments[0])
+        and os.path.isfile(arguments[0])
         and arguments[1] == expected_entry
         and plist.get("WorkingDirectory") == MINIAPP_DIR
+        and plist.get("StandardOutPath")
+        == os.path.join(state_dir, "miniapp.out.log")
+        and plist.get("StandardErrorPath")
+        == os.path.join(state_dir, "miniapp.err.log")
         and isinstance(environment, dict)
         and environment.get("MINIAPP_CONFIG") == config_path()
     )
@@ -536,6 +544,35 @@ def cmd_miniapp(args):
         print("no Mini App here -- run: python3 miniapp/setup-miniapp.py")
         return 1
 
+    if sub == "migrate-paths":
+        entry = os.path.join(MINIAPP_DIR, "server", "dist", "index.js")
+        print(
+            "before migration: installed paths %s"
+            % ("valid" if _installed_miniapp_paths_valid() else "stale")
+        )
+        if not os.path.isfile(entry):
+            print("Mini App build output is missing at %s" % entry)
+            print("after migration: not attempted")
+            return 1
+        command = [
+            "/usr/bin/python3",
+            os.path.join(MINIAPP_DIR, "setup-miniapp.py"),
+            "--migrate-paths",
+            "--config",
+            config_path(),
+            "--repository-root",
+            BRIDGE_DIR,
+        ]
+        process = subprocess.run(command, capture_output=True, text=True)
+        child_message = (process.stdout or process.stderr or "").strip()
+        if child_message:
+            print(child_message)
+        print(
+            "after migration: installed paths %s"
+            % ("valid" if _installed_miniapp_paths_valid() else "stale")
+        )
+        return process.returncode
+
     if sub == "status":
         _print_miniapp_status(miniapp_status())
         return 0
@@ -580,7 +617,7 @@ def cmd_miniapp(args):
         return 0 if healthy else 1
 
     print("unknown: bridgemon miniapp %s" % sub)
-    print("try: status | start | stop | restart | logs [n]")
+    print("try: status | start | stop | restart | logs [n] | migrate-paths")
     return 1
 
 
