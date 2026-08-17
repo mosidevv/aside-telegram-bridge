@@ -179,7 +179,7 @@ class SessionCreationTests(unittest.TestCase):
             {
                 "role": "assistant",
                 "content": [{"type": "text", "text": "ok"}],
-                "stopReason": "end_turn",
+                "stopReason": "stop",
             },
         ], session_dir=session_dir)
 
@@ -241,7 +241,7 @@ class SessionCreationTests(unittest.TestCase):
                 {
                     "role": "assistant",
                     "content": [],
-                    "stopReason": "tool_use",
+                    "stopReason": "toolUse",
                 },
             ])
             return 0, "", ""

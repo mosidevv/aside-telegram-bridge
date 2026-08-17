@@ -237,7 +237,7 @@ def _assistant_completed(record) -> bool:
     candidate = message if isinstance(message, dict) else record
     return bool(
         candidate.get("role") == "assistant"
-        and candidate.get("stopReason") == "end_turn"
+        and candidate.get("stopReason") in ("stop", "length")
     )
 
 
