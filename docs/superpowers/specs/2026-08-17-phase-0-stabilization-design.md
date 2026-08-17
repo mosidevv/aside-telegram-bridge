@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-17
 
-**Status:** Proposed for written-spec approval
+**Status:** Approved; implementation details amended after repository/API verification
 
 **Orchestration:** Sol Advisor 0.6 `audit` route, native-first
 **Primary objective:** Restore a trustworthy local deployment and a truthful `/new` workflow without discarding the existing recovery state or expanding into the later durable-queue redesign.
@@ -95,8 +95,9 @@ Create a small Python module, `aside_session.py`, that owns the unreliable bound
 It provides pure or dependency-injected functions for:
 
 - Normalizing a configured model selection.
-- Matching a model against an observed provider/model catalog.
-- Rejecting ambiguous or unavailable bare identifiers.
+- Resolving a bare model through the explicit `model_ids` configuration.
+- Checking that a configured provider appears among the connected credential-provider keys.
+- Rejecting unmapped bare identifiers rather than relying on Aside's implicit provider.
 - Constructing provider-qualified CLI arguments.
 - Taking a before-snapshot of session directories.
 - Polling for a newly created session using a bounded timeout and interval.
@@ -107,7 +108,7 @@ The bridge consumes a result rather than independently interpreting exit status 
 
 ```python
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 SessionCreationStatus = Literal[
     "created",
@@ -116,14 +117,22 @@ SessionCreationStatus = Literal[
     "invalid",
 ]
 
+SessionCreationError = Literal[
+    "configuration",
+    "availability",
+    "process",
+    "session",
+]
+
 
 @dataclass(frozen=True)
 class SessionCreationResult:
     status: SessionCreationStatus
+    error_code: Optional[SessionCreationError]
     model_id: str
-    provider_id: str | None
-    qualified_model: str | None
-    session_id: str | None
+    provider_id: Optional[str]
+    qualified_model: Optional[str]
+    session_id: Optional[str]
     user_message: str
     diagnostic: str
 ```
@@ -136,20 +145,21 @@ The boundary must not treat process exit code zero as proof of session creation.
 
 If the configured model is unavailable, the user-facing message names that exact condition rather than reporting that the session ID could not be found. Diagnostics may include provider and model names but not credentials or prompt/transcript content.
 
-### 4.2 Model resolution
+### 4.2 Model qualification and availability proof
 
-The local Aside catalog is authoritative for availability.
+Aside accepts `provider/model` but exposes no command that enumerates the models an account can actually use. The Mini App's existing catalog is curated display/configuration data seeded by credential-provider keys; it is not live availability proof. Phase 0 must not introduce a fictitious catalog check.
 
-Resolution rules:
+Qualification rules:
 
-1. A configured `provider/model` value is accepted only when that exact pair appears in the observed catalog.
-2. A bare model is accepted only when it maps to exactly one available provider/model pair.
-3. A missing bare model is rejected with an unavailable-model result.
-4. An ambiguous bare model is rejected and reports the available qualified choices.
-5. Static aliases may assist display or backwards compatibility but cannot override contrary live catalog evidence.
-6. No new duplicate Python-versus-TypeScript model table is introduced in Phase 0.
+1. A configured `provider/model` value is syntactically validated and used as written.
+2. A bare model is accepted only when the merged `model_ids` map—small built-in compatibility mappings plus explicit configuration overrides—maps it to one exact `provider/model` value.
+3. A bare model with no explicit mapping is rejected before `aside exec`; the error names the missing `model_ids` entry instead of allowing Aside to select an implicit provider.
+4. The qualified provider must appear among the top-level keys of the configured Aside credentials file. Credential values are never read.
+5. An unreadable or malformed credentials file fails closed for new-session creation and reports that provider connectivity could not be verified.
+6. Static aliases may map friendly names to model IDs, but aliases do not select providers.
+7. No new Python copy of the Mini App's curated model catalog is introduced.
 
-Catalog retrieval and parsing must be dependency-injected for tests. A catalog-read failure must fail closed for `/new`; it must not silently fall back to the provider behavior that caused the current failure.
+Actual model availability is proven only by the bounded session-creation handshake: Aside must accept the qualified identifier and create one usable session. Provider rejection is parsed and surfaced as `availability`; it is not replaced with a generic session-ID error. Configuration and credential-key readers must be dependency-injected for tests.
 
 ### 4.3 Deployment diagnostics
 
@@ -258,19 +268,20 @@ Normal logs must not include bot tokens, JWTs, full prompts, transcript bodies, 
 
 ### 6.1 Test framework
 
-- Use `pytest` for newly structured Python tests.
-- Convert only the directly affected legacy executable tests needed for Phase 0 discovery and isolation.
+- Production Python must remain compatible with launchd's `/usr/bin/python3` 3.9.6; do not use Python 3.10 union syntax or newer runtime-only features.
+- Use the Python standard library's `unittest` framework so Phase 0 does not add a package solely for test discovery; `pytest` is not currently installed in this project.
+- Convert only `tests/test_bridgemon.py`, the directly affected legacy executable test, into an import-safe `unittest` module.
 - Do not perform a broad test-suite rewrite in this phase.
-- Tests use temporary directories and dependency injection for repository roots, user state, launchd paths, Aside catalog output, process results, clocks, and polling intervals.
+- Tests use temporary directories and dependency injection for repository roots, user state, launchd paths, model mappings, credential-provider keys, process results, clocks, and polling intervals.
 - Tests must not read or mutate the real `~/Library/LaunchAgents`, `~/.aside`, Telegram, launchd services, or Cloudflare state.
 
 ### 6.2 Required model/session tests
 
-- Exact qualified model is accepted when available.
-- Bare model with one provider is qualified deterministically.
-- Bare model with multiple providers is rejected as ambiguous.
-- Missing model is rejected as unavailable.
-- Catalog failure does not fall back to an implicit provider.
+- Exact qualified model is accepted when its provider is connected.
+- Bare model with one explicit `model_ids` entry is qualified deterministically.
+- Bare model without a `model_ids` entry is rejected before process execution.
+- Qualified model with an unconnected provider is rejected before process execution.
+- Unreadable or malformed credentials do not fall back to an implicit provider.
 - Process exit zero with no new session is not success.
 - Process exit zero with a directory but no usable transcript is not success.
 - A valid session appearing after more than one second is accepted within the configured timeout.
@@ -317,8 +328,8 @@ It may:
 - Reload the Mini App LaunchAgent using the corrected local plist.
 - Query the local health endpoint.
 - Inspect launchd process metadata and non-secret logs.
-- Resolve the configured model through the local Aside catalog.
-- Create one harmless session whose prompt performs no filesystem, browser, network, account, or external-service action.
+- Resolve the configured model through explicit provider qualification and connected-provider evidence.
+- Invoke the new session-creation boundary directly to create one harmless session whose prompt performs no filesystem, browser, network, account, or external-service action.
 - Verify that the new session has valid local transcript state.
 
 It may not:
@@ -332,6 +343,8 @@ It may not:
 
 If harmless session creation itself could incur model usage, report that fact before the live smoke and use the smallest available validation prompt.
 
+The live smoke does not invoke Telegram `heavy_new()` because the current post-create path grants full access. Phase 0 proves the same qualified model and session-creation boundary directly, while unit/integration tests prove that `/new` consumes its structured result. Live permission behavior remains deferred to the approval/permission phase.
+
 ## 8. File-Level Design
 
 Expected repository changes:
@@ -340,8 +353,7 @@ Expected repository changes:
 - Modify `bridge.py`: call the new boundary while preserving unrelated current recovery edits.
 - Modify `bridgemon.py`: structured diagnosis, upstream resolution, path migration, and non-overwriting rollback behavior.
 - Modify `miniapp/setup-miniapp.py`: explicit stale-state-directory migration and reusable atomic configuration helpers, only if `bridgemon.py` should delegate the migration rather than own it.
-- Create or convert focused `tests/` modules for Aside session and deployment behavior.
-- Add minimal pytest configuration only if required for deterministic discovery.
+- Create or convert focused `unittest` modules under `tests/` for Aside session and deployment behavior.
 - Update `README.md` only where operator commands or recovery guarantees materially change.
 
 Files outside this list require an explicit design amendment before modification.
@@ -357,12 +369,12 @@ Phase 0 is accepted only when all of the following are evidenced:
 5. Mini App installed program, config, working directory, logs, and state directory point to the active checkout or the explicitly selected runtime directory.
 6. The Mini App LaunchAgent remains stable after reload.
 7. The actual loopback Mini App health endpoint responds successfully.
-8. The selected model resolves to one available provider-qualified identifier.
+8. The selected model resolves to one explicitly configured provider-qualified identifier whose provider is connected, and the session handshake proves actual availability.
 9. `/new` creates one usable session or returns the exact model/process/session failure category.
 10. Process exit zero without a valid session is never reported as success.
 11. Phase 0 Python tests pass hermetically.
 12. The Mini App production build passes.
-13. The bounded live smoke passes.
+13. The bounded direct session-boundary live smoke passes without granting full access.
 14. The focused security review has no unresolved required correction.
 15. The fresh Sol / High reviewer returns `ship` on the final verified diff.
 
@@ -380,7 +392,7 @@ These limitations must remain visible in the final Phase 0 handoff. A healthy de
 
 ## 11. Implementation Order
 
-1. Add the hermetic pytest foundation and checkpoint tests.
+1. Add the hermetic `unittest` foundation and checkpoint tests.
 2. Add failing model/session boundary tests.
 3. Implement `aside_session.py` and integrate `/new` minimally.
 4. Add failing deployment/upstream/rollback tests.
