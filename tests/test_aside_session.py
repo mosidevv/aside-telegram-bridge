@@ -481,6 +481,7 @@ class BridgeSessionIntegrationTests(unittest.TestCase):
         self.real_resolve_configured_model = bridge.resolve_configured_model
         bridge.run_aside = lambda *_args, **_kwargs: (0, "", "")
         bridge.newest_session_id = lambda **_kwargs: "unexpected-session"
+        bridge.probe_model = lambda *_args, **_kwargs: (True, "ok")
         bridge.resolve_configured_model = lambda _selection: (
             aside_session.ResolvedModel(
                 model_id="gpt-5.6-sol",
@@ -555,3 +556,53 @@ class BridgeSessionIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeModelTests(unittest.TestCase):
+    def setUp(self):
+        import aside_session
+        self.m = aside_session
+
+    def _runner(self, stdout, calls):
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(stdout=stdout, returncode=0)
+        return run
+
+    def test_completed_turn_is_usable_and_session_is_archived(self):
+        calls = []
+        out = json.dumps({"session": {"id": "abc"}, "outcome": "completed",
+                          "answer": "ok", "error": None})
+        ok, _ = self.m.probe_model("aside", "claude-code/x",
+                                   runner=self._runner(out, calls))
+        self.assertTrue(ok)
+        self.assertEqual(calls[0][1:3], ["-m", "claude-code/x"])
+        self.assertEqual(calls[1][1:], ["session", "archive", "abc"])
+
+    def test_failed_turn_reports_aside_error(self):
+        out = json.dumps({"session": {"id": "abc"}, "outcome": "failed",
+                          "error": "model is not available"})
+        ok, reason = self.m.probe_model("aside", "p/m",
+                                        runner=self._runner(out, []))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "model is not available")
+
+    def test_garbage_output_is_not_usable(self):
+        ok, _ = self.m.probe_model("aside", "p/m",
+                                   runner=self._runner("nope", []))
+        self.assertFalse(ok)
+
+    def test_timeout_is_not_usable(self):
+        def run(cmd, **kwargs):
+            raise self.m.subprocess.TimeoutExpired(cmd, 1)
+        ok, reason = self.m.probe_model("aside", "p/m", runner=run)
+        self.assertFalse(ok)
+        self.assertIn("timed out", reason)
+
+    def test_builtin_aside_provider_resolves_without_credentials(self):
+        r = self.m.resolve_model("aside/gpt-6.1-sol", {}, frozenset())
+        self.assertEqual(r.qualified_model, "aside/gpt-6.1-sol")
+
+    def test_unknown_provider_still_rejected(self):
+        with self.assertRaises(self.m.ModelResolutionError):
+            self.m.resolve_model("other/x", {}, frozenset({"claude-code"}))

@@ -31,6 +31,10 @@ DEFAULT_MODEL_IDS = {
 }
 
 
+# Providers that Aside itself supplies; they never appear in credentials.json.
+BUILTIN_PROVIDERS = frozenset({"aside"})
+
+
 @dataclass(frozen=True)
 class ResolvedModel:
     """A model selection proven to have an explicit connected provider."""
@@ -158,7 +162,7 @@ def resolve_model(
             )
 
     provider_id, model_id = _split_qualified_model(qualified_model)
-    if provider_id not in connected_providers:
+    if provider_id not in connected_providers | BUILTIN_PROVIDERS:
         raise ModelResolutionError(
             "configuration",
             "The selected model provider is not connected in Aside.",
@@ -170,6 +174,59 @@ def resolve_model(
         provider_id=provider_id,
         qualified_model=qualified_model,
     )
+
+
+PROBE_PROMPT = "Reply with the single word ok. Do not use any tools."
+
+
+def probe_model(
+    aside_cli: str,
+    qualified_model: str,
+    timeout_seconds: int = 90,
+    runner: Callable = subprocess.run,
+) -> Tuple[bool, str]:
+    """Ask Aside to run one tiny turn on the model; return (usable, reason).
+
+    A provider can be connected while the account still cannot use a given
+    model, so only a real request proves the model works. The reason is safe
+    to show the user. The probe session is archived on a best-effort basis.
+    """
+
+    cmd = [
+        aside_cli, "-m", qualified_model, "--effort", "low",
+        "--timeout", "{}s".format(max(timeout_seconds - 15, 10)),
+        "--json", PROBE_PROMPT,
+    ]
+    try:
+        completed = runner(
+            cmd, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return False, "the test request timed out"
+    except OSError as exc:
+        return False, "Aside could not be started ({})".format(
+            type(exc).__name__)
+
+    try:
+        result = json.loads(completed.stdout or "")
+    except ValueError:
+        return False, "Aside returned an unreadable reply"
+    if not isinstance(result, dict):
+        return False, "Aside returned an unreadable reply"
+
+    session = result.get("session")
+    session_id = session.get("id") if isinstance(session, dict) else None
+    if isinstance(session_id, str) and session_id:
+        try:
+            runner([aside_cli, "session", "archive", session_id],
+                   capture_output=True, text=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    if result.get("outcome") == "completed":
+        return True, "ok"
+    error = result.get("error")
+    return False, (error if isinstance(error, str) and error
+                   else "the model did not complete the test request")[:300]
 
 
 def _session_result(
