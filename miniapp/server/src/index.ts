@@ -26,7 +26,7 @@ async function main(): Promise<void> {
     webDist,
     jwtSecret,
     logger: process.env.MINIAPP_LOG !== '0',
-    publicUrl: () => tunnel?.url ?? null,
+    publicUrl: () => config.miniapp.publicUrl || (tunnel?.url ?? null),
     version: process.env.MINIAPP_VERSION || '0.1.0',
   });
 
@@ -39,7 +39,20 @@ async function main(): Promise<void> {
     `aside mini app listening on http://${host}:${config.port}`,
   );
 
-  if (config.miniapp.tunnel === 'cloudflared') {
+  if (config.miniapp.publicUrl) {
+    // A fixed address (named tunnel run separately): nothing to start, and it
+    // never rotates. Still keep Telegram's menu button pointed at it.
+    app.log.info(`public url: ${config.miniapp.publicUrl}`);
+    if (config.miniapp.autoRegisterMenu) {
+      menuKeeper = keepMenuButtonCurrent({
+        botToken: config.botToken,
+          chatId: config.allowedUserId,
+        getUrl: () => config.miniapp.publicUrl,
+        log: (message) => app.log.info(message),
+      });
+      void menuKeeper.sync();
+    }
+  } else if (config.miniapp.tunnel === 'cloudflared') {
     tunnel = new Tunnel({
       port: config.port,
       binDir: defaultBinDir(config.miniapp.stateDir),
@@ -57,6 +70,7 @@ async function main(): Promise<void> {
         // keeps checking that Telegram still points at the live tunnel.
         menuKeeper ??= keepMenuButtonCurrent({
           botToken: config.botToken,
+          chatId: config.allowedUserId,
           getUrl: () => tunnel?.url ?? null,
           log: (message) => app.log.info(message),
         });

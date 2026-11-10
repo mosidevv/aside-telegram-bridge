@@ -80,6 +80,22 @@ const DEFAULT_MODEL_ALIASES: Record<string, string> = {
   opus: 'claude-opus-4-8',
 };
 
+/**
+ * A configured public URL, or "" if absent. Only a plain https origin is
+ * accepted, because Telegram requires HTTPS for Mini Apps and a typo here
+ * would otherwise register a dead menu button.
+ */
+export function parsePublicUrl(value: unknown): string {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:') return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
+
 /** The `miniapp` section of the bridge config. All of it is optional. */
 export interface MiniappSection {
   /** `"cloudflared"` manages a public HTTPS tunnel; `"none"` stays local. */
@@ -91,6 +107,12 @@ export interface MiniappSection {
    * flipping this is the owner's call, not the installer's.
    */
   autoRegisterMenu: boolean;
+  /**
+   * A fixed public HTTPS address (a named Cloudflare tunnel you run yourself).
+   * When set, no quick tunnel is started: the address never rotates, so the
+   * menu button only has to be registered once and then kept in sync.
+   */
+  publicUrl: string;
   port: number;
   /** Where cloudflared and the runtime state live -- never in the repo. */
   stateDir: string;
@@ -269,6 +291,7 @@ export function loadConfig(): MiniappConfig {
       menuOverride === '0'
         ? false
         : menuOverride === '1' || section.auto_register_menu === true,
+    publicUrl: parsePublicUrl(section.public_url),
     port,
     stateDir,
     cloudflaredPath: expandHome(

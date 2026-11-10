@@ -25,6 +25,7 @@ import {
   sha256File,
   userSuppliedCloudflared,
 } from '../src/tunnel.js';
+import { parsePublicUrl } from '../src/config.js';
 
 /** Real `cloudflared tunnel --url` banner output. */
 const BANNER = `
@@ -485,6 +486,62 @@ describe('keepMenuButtonCurrent', () => {
     const { keeper } = make(tg, null);
     expect(await keeper.sync()).toBe(false);
     expect(tg.state.gets + tg.state.sets).toBe(0);
+    keeper.stop();
+  });
+});
+
+describe('parsePublicUrl', () => {
+  it('accepts an https origin and drops any path', () => {
+    expect(parsePublicUrl('https://aside.example.com/')).toBe('https://aside.example.com');
+    expect(parsePublicUrl(' https://aside.example.com/x?y=1 ')).toBe('https://aside.example.com');
+  });
+
+  it('rejects anything Telegram could not open', () => {
+    expect(parsePublicUrl('http://aside.example.com')).toBe('');
+    expect(parsePublicUrl('aside.example.com')).toBe('');
+    expect(parsePublicUrl('')).toBe('');
+    expect(parsePublicUrl(undefined)).toBe('');
+    expect(parsePublicUrl(42)).toBe('');
+  });
+});
+
+describe('menu button for the owner chat', () => {
+  it('includes chat_id only when one is given', () => {
+    expect(menuButtonPayload('https://a.example.com')).not.toHaveProperty('chat_id');
+    expect(menuButtonPayload('https://a.example.com', 'Aside', 42)).toMatchObject({
+      chat_id: 42,
+    });
+  });
+
+  it('registers and reads back the button for that chat', async () => {
+    const bodies: any[] = [];
+    let current = 'https://old.example.com/';
+    const fetchFn = (async (url: string, init: any) => {
+      const body = JSON.parse(init.body);
+      bodies.push(body);
+      if (url.endsWith('/setChatMenuButton')) {
+        current = body.menu_button.web_app.url + '/';
+        return { json: async () => ({ ok: true }) };
+      }
+      return {
+        json: async () => ({
+          ok: true,
+          result: { type: 'web_app', web_app: { url: current } },
+        }),
+      };
+    }) as unknown as typeof fetch;
+    const keeper = keepMenuButtonCurrent({
+      botToken: 'T',
+      chatId: 42,
+      getUrl: () => 'https://new.example.com',
+      log: () => {},
+      fetchFn,
+      sleep: async () => {},
+      intervalMs: 3_600_000,
+    });
+    expect(await keeper.sync()).toBe(true);
+    expect(bodies.every((b) => b.chat_id === 42)).toBe(true);
+    expect(current).toBe('https://new.example.com/');
     keeper.stop();
   });
 });

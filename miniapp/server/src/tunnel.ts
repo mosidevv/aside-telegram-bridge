@@ -380,8 +380,13 @@ export class Tunnel {
  * Built as a pure function so it can be asserted in tests without any
  * chance of a request going out.
  */
-export function menuButtonPayload(url: string, text = 'Aside') {
+export function menuButtonPayload(
+  url: string,
+  text = 'Aside',
+  chatId?: number,
+) {
   return {
+    ...(chatId === undefined ? {} : { chat_id: chatId }),
     menu_button: {
       type: 'web_app',
       text,
@@ -402,13 +407,14 @@ export async function registerMenuButton(
   botToken: string,
   url: string,
   fetchFn: typeof fetch = fetch,
+  chatId?: number,
 ): Promise<{ ok: boolean; description?: string }> {
   const res = await fetchFn(
     `https://api.telegram.org/bot${botToken}/setChatMenuButton`,
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(menuButtonPayload(url)),
+      body: JSON.stringify(menuButtonPayload(url, 'Aside', chatId)),
     },
   );
   const body = (await res.json()) as { ok?: boolean; description?: string };
@@ -425,13 +431,14 @@ function sameUrl(a: string | null, b: string | null): boolean {
 export async function getMenuButtonUrl(
   botToken: string,
   fetchFn: typeof fetch = fetch,
+  chatId?: number,
 ): Promise<string | null> {
   const res = await fetchFn(
     `https://api.telegram.org/bot${botToken}/getChatMenuButton`,
     {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify(chatId === undefined ? {} : { chat_id: chatId }),
     },
   );
   const body = (await res.json()) as {
@@ -444,6 +451,12 @@ export async function getMenuButtonUrl(
 
 export interface MenuKeeperOptions {
   botToken: string;
+  /**
+   * The owner's chat. Telegram applies a per-chat menu button reliably, but
+   * was seen accepting a change to the bot-wide default without applying it,
+   * so the button is registered and verified for this chat.
+   */
+  chatId?: number;
   /** The tunnel's CURRENT url (it rotates), or null while it is down. */
   getUrl: () => string | null;
   log: (message: string) => void;
@@ -478,9 +491,9 @@ export function keepMenuButtonCurrent(opts: MenuKeeperOptions): MenuKeeper {
   let stopped = false;
 
   const attemptOnce = async (url: string): Promise<boolean> => {
-    const current = await getMenuButtonUrl(opts.botToken, fetchFn);
+    const current = await getMenuButtonUrl(opts.botToken, fetchFn, opts.chatId);
     if (sameUrl(current, url)) return true;
-    const res = await registerMenuButton(opts.botToken, url, fetchFn);
+    const res = await registerMenuButton(opts.botToken, url, fetchFn, opts.chatId);
     if (!res.ok) throw new Error(res.description || 'Telegram rejected the menu button');
     opts.log('menu button registered');
     return true;

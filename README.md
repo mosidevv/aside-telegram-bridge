@@ -124,7 +124,14 @@ It checks for Node 20+, builds the app, installs a launchd service
 (`com.aside.miniapp`), starts a Cloudflare quick tunnel so Telegram can
 reach it over HTTPS, and points the bot's menu button at it -- that button
 is the **Aside** entry you tap. Quick-tunnel URLs rotate on restart and the
-server re-registers the button each time, so it keeps working.
+server re-registers the button each time, retrying with backoff and
+re-checking every five minutes, so a failed registration heals itself.
+
+**Stable address (recommended).** Run your own named Cloudflare tunnel and set
+`"public_url": "https://aside.example.com"` in the `miniapp` section of
+`config.json`. The server then starts no quick tunnel and keeps the menu
+button on that fixed address, so nothing rotates. Check everything end to end
+with `bridgemon doctor --live`.
 
 **How auth works.** Telegram signs every Mini App launch with an HMAC over
 your bot token; the server validates that signature, checks the user id
