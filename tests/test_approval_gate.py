@@ -80,8 +80,8 @@ check("approve: state cleared", b.state["approval"] is None)
 check("approve: one task queued", b.TASKS.qsize() == 1)
 kind, payload = b.TASKS.get_nowait()
 check("approve: inject is a proceed msg",
-      kind == "msg" and "APPROVAL GRANTED" in payload and
-      "Proceed" in payload)
+      kind == "msg" and "APPROVAL GRANTED" in payload["text"] and
+      "Proceed" in payload["text"])
 check("approve: edited the buttons message",
       any(s[0] == "editMessageText" for s in SENT))
 
@@ -94,8 +94,8 @@ while not b.TASKS.empty():
 b._handle_approval_tap("apv:deny:t2", 1)
 kind, payload = b.TASKS.get_nowait()
 check("deny: inject is an abort msg",
-      kind == "msg" and "APPROVAL DENIED" in payload and
-      "Do not perform" in payload)
+      kind == "msg" and "APPROVAL DENIED" in payload["text"] and
+      "Do not perform" in payload["text"])
 check("deny: state cleared", b.state["approval"] is None)
 
 # ---- 5. stale/duplicate tap is graceful ---------------------------

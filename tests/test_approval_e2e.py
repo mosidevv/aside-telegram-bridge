@@ -86,8 +86,9 @@ if b.state.get("approval"):
     b._handle_approval_tap("apv:%s:%s" % (MODE, tok), 4242)
     kind, payload = b.TASKS.get_nowait()
     tag = "GRANTED" if MODE == "approve" else "DENIED"
-    check("tap: %s msg queued" % MODE, kind == "msg" and tag in payload)
-    b.handle_message(payload)
+    check("tap: %s msg queued" % MODE,
+          kind == "msg" and tag in (payload["text"] if isinstance(payload, dict) else payload))
+    b.handle_message(payload["text"], session_id=payload["session_id"])
     exists = os.path.exists(TARGET)
     if MODE == "approve":
         ok = exists

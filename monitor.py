@@ -96,7 +96,10 @@ def bridge_pid():
 def exec_pids():
     """PIDs of in-flight aside CLI turns spawned by the bridge."""
     try:
-        out = subprocess.run(["pgrep", "-f", "MacOS/aside exec"],
+        # New sessions run as `aside ... exec`, follow-ups as
+        # `aside ... session resume <id>` (the CLI dropped exec --session).
+        out = subprocess.run(["pgrep", "-f",
+                              "MacOS/aside .*(exec|session resume) "],
                              capture_output=True, text=True).stdout
         return [int(p) for p in out.split()]
     except Exception:  # noqa: BLE001

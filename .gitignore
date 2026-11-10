@@ -37,3 +37,9 @@ channel-guard*.py
 channel-guard*.json
 monitor-native-channel.py
 rollback-native-migration.sh
+
+# --- local clutter ----------------------------------------------------
+# macOS custom folder icons ("Icon" plus a carriage return) and one-off backups.
+Icon?
+*.before-*
+miniapp-soft-confirm.json

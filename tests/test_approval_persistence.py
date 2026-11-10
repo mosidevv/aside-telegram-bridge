@@ -45,11 +45,12 @@ check("persist: token preserved",
 
 # after "restart", the callback resolves against the reloaded state
 b.state = reloaded
+b.state["session_id"] = "S1"
 b.state.setdefault("approval", None)
 b._handle_approval_tap("apv:approve:abc123", 7)
 check("persist: tap after restart resolves", b.state.get("approval") is None)
 check("persist: proceed turn injected",
-      any(k == "msg" and "GRANTED" in p for k, p in SENT_TASKS))
+      any(k == "msg" and "GRANTED" in p["text"] for k, p in SENT_TASKS))
 
 os.unlink(tmp.name)
 print("\n%d failed" % len(fails))

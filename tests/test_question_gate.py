@@ -178,9 +178,9 @@ b._handle_question_tap("qst:%s:1" % token, 99)
 tasks = drain_tasks()
 check("tap: one task queued", len(tasks) == 1)
 check("tap: answer carries header and label",
-      tasks and tasks[0] == ("msg", "Pick a branch: develop"))
+      tasks and tasks[0] == ("msg", {"text": "Pick a branch: develop", "session_id": "TESTSESS"}))
 check("tap: the answer never starts with a dash",
-      tasks and not tasks[0][1].startswith("-"))
+      tasks and not tasks[0][1]["text"].startswith("-"))
 check("tap: state cleared", b.state["question"] is None)
 
 # a stale tap must not resolve anything
@@ -193,6 +193,7 @@ check("stale: not consumed", b.state["question"] is not None)
 check("stale: user told", any("isn't open anymore" in t for t in TEXTS))
 
 # an out-of-range index must not crash
+b.state["question"]["session_id"] = "TESTSESS"
 TEXTS.clear()
 b._handle_question_tap("qst:LIVE:99", 1)
 check("bad index: told to reply instead",

@@ -9,7 +9,6 @@ import json
 import os
 import queue
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -22,6 +21,7 @@ from aside_session import (
     ModelResolutionError,
     create_new_session,
     merge_model_ids,
+    probe_model,
     read_connected_providers,
     resolve_model,
 )
@@ -230,7 +230,7 @@ STYLE_PRESETS = {
 def _style_preset(name):
     return STYLE_PRESETS.get(name, STYLE_PRESETS["formal"])
 
-STATE_LOCK = threading.Lock()
+STATE_LOCK = threading.RLock()
 
 
 def log(msg):
@@ -255,7 +255,10 @@ def save_json(path, data):
     with STATE_LOCK:
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
             json.dump(data, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
 
 
@@ -368,21 +371,76 @@ def html_escape(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+DELIVERY_LOCK = threading.RLock()
+
+
 def send_text(text):
+    """Retain plain-text replies before sending, including across restarts."""
     text = text.strip()
     if not text:
         return
-    while text:
-        chunk = text[:TG_LIMIT]
-        text = text[TG_LIMIT:]
-        for attempt in range(3):
+    chunks = [text[i:i + TG_LIMIT] for i in range(0, len(text), TG_LIMIT)]
+    with DELIVERY_LOCK:
+        with STATE_LOCK:
+            old = state.get("undelivered_texts", [])
+            state["undelivered_texts"] = old + chunks
             try:
-                tg("sendMessage", {"chat_id": CHAT_ID, "text": chunk},
-                   timeout=30)
-                break
-            except Exception as e:  # noqa: BLE001
-                log("sendMessage failed (%s), retry %d" % (e, attempt))
-                time.sleep(2 * (attempt + 1))
+                save_json(STATE_PATH, state)
+            except Exception:
+                state["undelivered_texts"] = old
+                raise
+        flush_outbox()
+
+
+def flush_outbox():
+    """Ordered, at-least-once delivery. A lost HTTP response may duplicate text."""
+    with DELIVERY_LOCK:
+        while state.get("undelivered_texts"):
+            chunk = state["undelivered_texts"][0]
+            for attempt in range(3):
+                try:
+                    result = tg("sendMessage", {"chat_id": CHAT_ID, "text": chunk},
+                                timeout=30)
+                    if not result.get("ok"):
+                        raise RuntimeError("Telegram rejected sendMessage")
+                    break
+                except urllib.error.HTTPError as e:
+                    # 400 means this exact text can never be sent (empty,
+                    # too long, malformed). Retrying would block every later
+                    # reply, so drop only this chunk. Other codes (429, 5xx,
+                    # 401, 403) are not about the text and stay retryable.
+                    if e.code == 400:
+                        log("dropping undeliverable chunk (%d chars): HTTP 400"
+                            % len(chunk))
+                        break
+                    log("sendMessage failed (%s), retry %d" % (e, attempt))
+                    if attempt == 2:
+                        log("reply retained in outbox for later delivery")
+                        return
+                    time.sleep(2 * (attempt + 1))
+                except Exception as e:  # noqa: BLE001
+                    log("sendMessage failed (%s), retry %d" % (e, attempt))
+                    if attempt == 2:
+                        log("reply retained in outbox for later delivery")
+                        return
+                    time.sleep(2 * (attempt + 1))
+            with STATE_LOCK:
+                old = state["undelivered_texts"]
+                state["undelivered_texts"] = old[1:]
+                try:
+                    save_json(STATE_PATH, state)
+                except Exception:
+                    state["undelivered_texts"] = old
+                    raise
+
+
+def outbox_loop():
+    while True:
+        try:
+            flush_outbox()
+        except Exception as exc:  # noqa: BLE001
+            log("outbox retry failed: %s" % exc)
+        time.sleep(10)
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -503,7 +561,13 @@ class Typing:
 
 
 def session_msg_file(session_id):
-    for name in os.listdir(SESSIONS_DIR):
+    if not session_id:
+        return None
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return None
+    for name in names:
         if name.endswith("_" + session_id):
             return os.path.join(SESSIONS_DIR, name, "messages.jsonl")
     return None
@@ -582,13 +646,15 @@ def run_aside(prompt, session_id=None, model=None, effort=None):
     log("EXEC start session=%s model=%s effort=%s"
         % (session_id or "-", model or "-", effort or "-"))
     t0 = time.time()
-    cmd = [ASIDE_CLI, "exec"]
-    if session_id:
-        cmd += ["--session", session_id]
+    # Aside CLI 1.26.916 dropped `aside exec --session`; follow-ups use
+    # `aside session resume <id>`, which only takes --account, so -m and
+    # --effort must come BEFORE the subcommand as root options.
+    cmd = [ASIDE_CLI]
     if model:
         cmd += ["-m", model]
     if effort:
         cmd += ["--effort", effort]
+    cmd += (["session", "resume", session_id] if session_id else ["exec"])
     cmd += ["--", prompt]
     try:
         p = subprocess.run(
@@ -963,6 +1029,12 @@ def _handle_approval_tap(data, mid):
                timeout=15)
         send_text("that approval request isn't active anymore")
         return
+    if ap.get("session_id") != state.get("session_id"):
+        send_text("that approval belongs to another session; switch back before answering")
+        return
+    if verdict not in ("approve", "deny"):
+        send_text("invalid approval choice")
+        return
     approved = verdict == "approve"
     action = ap.get("action") or "the proposed action"
     if mid:
@@ -981,7 +1053,7 @@ def _handle_approval_tap(data, mid):
         inject = ("[APPROVAL DENIED by %s] I did not approve the action "
                   "you proposed (%s). Do not perform it. Acknowledge "
                   "briefly and stand by." % (OWNER, action))
-    TASKS.put(("msg", inject))
+    TASKS.put(("msg", {"text": inject, "session_id": ap["session_id"]}))
     if WORKER_BUSY.is_set() and not QUEUED_NOTE_SENT.is_set():
         QUEUED_NOTE_SENT.set()
         tg_send_status("\U0001f4e5 got it -- queued for right after "
@@ -1024,6 +1096,9 @@ def handle_callback(cq):
         if level == "cancel":
             send_text("ok, staying put")
             return
+        if level not in EFFORT_LEVELS:
+            send_text("invalid effort choice; use /effort to open a fresh picker")
+            return
         state["effort_next"] = level
         save_json(STATE_PATH, state)
         log("EFFORT set via picker -> %s" % level)
@@ -1038,9 +1113,96 @@ def handle_callback(cq):
 
 
 # --- task queue between poller and worker ---
-TASKS = queue.Queue()
+INCOMING = threading.local()
+
+
+class DurableTaskQueue(queue.Queue):
+    """Single-consumer FIFO: persist waiting and in-flight work before handoff.
+
+    Queue's mutex is always acquired before STATE_LOCK. No caller may hold
+    STATE_LOCK while calling a queue method.
+    """
+    def __init__(self):
+        super().__init__()
+        for item in state.get("queued_tasks", []):
+            self.queue.append(tuple(item))
+            self.unfinished_tasks += 1
+
+    def _put(self, item):
+        with STATE_LOCK:
+            old = state.get("queued_tasks", [])
+            offset = state["offset"]
+            update_id = getattr(INCOMING, "update_id", None)
+            if update_id is not None:
+                state["offset"] = update_id + 1
+            state["queued_tasks"] = old + [list(item)]
+            try:
+                save_json(STATE_PATH, state)
+            except Exception:
+                state["queued_tasks"] = old
+                state["offset"] = offset
+                raise
+        super()._put(item)
+
+    def _get(self):
+        item = self.queue[0]
+        with STATE_LOCK:
+            old = state.get("queued_tasks", [])
+            active = state.get("active_task")
+            state["queued_tasks"] = old[1:]
+            state["active_task"] = list(item)
+            try:
+                save_json(STATE_PATH, state)
+            except Exception:
+                state["queued_tasks"] = old
+                state["active_task"] = active
+                raise
+        return super()._get()
+
+    def task_done(self):
+        with STATE_LOCK:
+            active = state.get("active_task")
+            state["active_task"] = None
+            try:
+                save_json(STATE_PATH, state)
+            except Exception:
+                state["active_task"] = active
+                raise
+        super().task_done()
+
+
+TASKS = DurableTaskQueue()
 WORKER_BUSY = threading.Event()
 QUEUED_NOTE_SENT = threading.Event()
+
+
+MODEL_SWITCH_LOCK = threading.Lock()
+
+
+def run_in_background(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def finish_model_switch(candidate, resolved):
+    """Test the model with a real request, then save it only if it works.
+
+    The caller holds MODEL_SWITCH_LOCK; it is released here."""
+    try:
+        usable, reason = probe_model(ASIDE_CLI, resolved.qualified_model)
+        if not usable:
+            log("MODEL probe failed %s: %s"
+                % (resolved.qualified_model, reason))
+            send_text("not switching, %s did not work: %s\nstill using: %s"
+                      % (resolved.qualified_model, reason, state["model"]))
+            return
+        with STATE_LOCK:
+            state["model"] = candidate
+            save_json(STATE_PATH, state)
+        send_text("switched to %s (%s)" % (candidate, resolved.qualified_model))
+    except Exception as exc:  # noqa: BLE001
+        log("MODEL switch error: %s" % exc)
+    finally:
+        MODEL_SWITCH_LOCK.release()
 
 
 def handle_command(text):
@@ -1055,11 +1217,12 @@ def handle_command(text):
     elif cmd == "/status":
         send_text(
             "model: %s\nsession: %s\neffort: %s\n"
-            "agent: %s\nqueue: %d waiting"
+            "agent: %s\nqueue: %d waiting\nreplies awaiting delivery: %d\ninterrupted tasks: %d"
             % (state["model"], state["session_id"],
                state["effort_next"] or DEFAULT_EFFORT + " (default)",
                "mid-task" if WORKER_BUSY.is_set() else "idle",
-               TASKS.qsize())
+               TASKS.qsize(), len(state.get("undelivered_texts", [])),
+               len(state.get("interrupted_tasks", [])))
         )
     elif cmd == "/model":
         if not arg:
@@ -1068,9 +1231,25 @@ def handle_command(text):
                 % state["model"]
             )
             return
-        state["model"] = MODEL_ALIASES.get(arg, arg)
-        save_json(STATE_PATH, state)
-        send_text("switched to %s" % state["model"])
+        candidate = MODEL_ALIASES.get(arg, arg)
+        try:
+            resolved = resolve_configured_model(candidate)
+        except ModelResolutionError as exc:
+            log("MODEL rejected %r: %s" % (candidate, exc.diagnostic))
+            send_text(
+                "not switching, %s\nstill using: %s\n"
+                "use an alias, a model listed in config model_ids, "
+                "or a full provider/model id."
+                % (exc.user_message, state["model"])
+            )
+            return
+        if not MODEL_SWITCH_LOCK.acquire(blocking=False):
+            send_text("still checking the previous model, try again in a moment")
+            return
+        send_text("checking %s..." % resolved.qualified_model)
+        # The test request can take up to ~90s; run it off the polling thread
+        # so Telegram updates (and button taps) keep flowing meanwhile.
+        run_in_background(finish_model_switch, candidate, resolved)
     elif cmd == "/usage":
         TASKS.put(("cmd", "/usage"))
         if WORKER_BUSY.is_set():
@@ -1152,6 +1331,18 @@ def heavy_new():
     except ModelResolutionError as exc:
         log("NEW blocked model configuration: %s" % exc.diagnostic)
         send_text(exc.user_message)
+        return
+
+    # Test the model first. An expired provider sign-in otherwise surfaces as a
+    # vague "model unavailable" after a full session start.
+    usable, reason = probe_model(ASIDE_CLI, resolved.qualified_model)
+    if not usable:
+        log("NEW blocked, model probe failed %s: %s"
+            % (resolved.qualified_model, reason))
+        send_text("can't start a new session: %s did not work (%s). If this "
+                  "is a ChatGPT or Claude model, sign in to that provider "
+                  "again in Aside. Or switch with /model."
+                  % (resolved.qualified_model, reason))
         return
 
     result = create_new_session(
@@ -1280,7 +1471,7 @@ def parse_approval(text):
     return {"action": action, "details": details, "raw": body}
 
 
-def present_approval(ap):
+def present_approval(ap, session_id=None):
     """Send the Approve/Deny inline keyboard and record pending state."""
     token = os.urandom(6).hex()
     lines = ["\U0001f510 Approval needed", "", "Action: " + ap["action"]]
@@ -1305,7 +1496,7 @@ def present_approval(ap):
                   "reply APPROVE or DENY:\n\n" + ap["action"])
     state["approval"] = {
         "token": token, "action": ap["action"], "details": ap["details"],
-        "session_id": state["session_id"], "message_id": mid,
+        "session_id": session_id or state["session_id"], "message_id": mid,
         "ts": time.time(),
     }
     save_json(STATE_PATH, state)
@@ -1387,7 +1578,7 @@ def parse_question(text):
     }
 
 
-def present_question(q):
+def present_question(q, session_id=None):
     """Send the question as inline buttons and record pending state."""
     token = os.urandom(6).hex()
     lines = ["❓ " + q["header"], "", q["question"]]
@@ -1425,7 +1616,7 @@ def present_question(q):
     state["question"] = {
         "token": token, "header": q["header"], "question": q["question"],
         "options": [o["label"] for o in q["options"]],
-        "session_id": state["session_id"], "message_id": mid,
+        "session_id": session_id or state["session_id"], "message_id": mid,
         "ts": time.time(),
     }
     save_json(STATE_PATH, state)
@@ -1445,9 +1636,15 @@ def _handle_question_tap(data, mid):
                timeout=15)
         send_text("that question isn't open anymore")
         return
+    if pending.get("session_id") != state.get("session_id"):
+        send_text("that question belongs to another session; switch back before answering")
+        return
     options = pending.get("options") or []
     try:
-        label = options[int(index)]
+        selected = int(index)
+        if selected < 0:
+            raise IndexError()
+        label = options[selected]
     except (ValueError, IndexError):
         send_text("couldn't tell which option that was, just reply instead")
         return
@@ -1463,7 +1660,10 @@ def _handle_question_tap(data, mid):
     # Deliberately NOT a bulleted "- <header>: <label>": a leading dash
     # makes the CLI's argument parser read the whole prompt as a flag.
     # Same reasoning as answerMessage() in the Mini App.
-    TASKS.put(("msg", "%s: %s" % (header, label) if header else label))
+    TASKS.put(("msg", {
+        "text": "%s: %s" % (header, label) if header else label,
+        "session_id": pending["session_id"],
+    }))
     if WORKER_BUSY.is_set() and not QUEUED_NOTE_SENT.is_set():
         QUEUED_NOTE_SENT.set()
         tg_send_status("\U0001f4e5 got it -- queued for right after "
@@ -1867,8 +2067,14 @@ def stream_new(msg_file, pos, turn):
     return pos + consumed, saw
 
 
-def handle_message(text):
-    msg_file = session_msg_file(state["session_id"])
+def handle_message(text, session_id=None):
+    # A picker may switch global state while this turn is still running.
+    session_id = session_id or state["session_id"]
+    if not session_id:
+        send_text("there is no verified session. Use /new before sending a task.")
+        return
+    model = state["model"]
+    msg_file = session_msg_file(session_id)
     offset = 0
     if msg_file and os.path.exists(msg_file):
         offset = os.path.getsize(msg_file)
@@ -1881,8 +2087,8 @@ def handle_message(text):
     def runner():
         result["r"] = run_aside(
             text + STYLE_TAG + QUESTION_REMINDER,
-            session_id=state["session_id"],
-            model=state["model"],
+            session_id=session_id,
+            model=model,
             effort=effort,
         )
 
@@ -1894,14 +2100,14 @@ def handle_message(text):
         while worker.is_alive():
             worker.join(timeout=2.0)
             if msg_file is None:
-                msg_file = session_msg_file(state["session_id"])
+                msg_file = session_msg_file(session_id)
             offset, s = stream_new(msg_file, offset, turn)
             sent_any = sent_any or s
             turn.flush()
 
     code, out, err = result.get("r", (-1, "", "bridge worker died"))
     if msg_file is None:
-        msg_file = session_msg_file(state["session_id"])
+        msg_file = session_msg_file(session_id)
     offset, s = stream_new(msg_file, offset, turn)
     sent_any = sent_any or s
     # The underlying aside session is done the instant the subprocess
@@ -1942,32 +2148,27 @@ def handle_message(text):
     QUEUED_NOTE_SENT.clear()
     turn.finish()
 
+    # A valid approval or question card always wins: the agent stopped on
+    # purpose to ask, and an error row earlier in the transcript (for example
+    # a rate limit that was retried) must not throw the card away.
+    failed = read_error_since(msg_file, orig_offset) if msg_file else ""
     if approval:
-        present_approval(approval)
+        present_approval(approval, session_id=session_id)
     elif question:
         # `turn.finish()` above has already sent whatever the agent said
         # around the block, with the markers removed.
-        present_question(question)
+        present_question(question, session_id=session_id)
+    elif code != 0 or failed:
+        send_text("that turn did not complete: %s" % (failed or err or "unknown error")[:300])
     elif not sent_any:
         if out.strip():
             send_bubbles(out.strip())
-        elif code != 0:
-            send_text("hit an error running that: %s"
-                      % (err or "unknown")[:300])
         else:
-            # Exit 0 with no text is usually a provider refusal (a rate
-            # limit, an expired sign-in), which the transcript records
-            # and stdout does not. See read_error_since.
-            failed = read_error_since(msg_file, orig_offset) if msg_file else ""
-            if failed:
-                send_text("the model provider refused that turn: %s"
-                          % failed[:300])
-            else:
-                send_text("done, but no text came back. odd. check the mac?")
+            send_text("the session returned no reply. Check its transcript before retrying.")
 
 
 def worker_loop():
-    """Consumes tasks one at a time. Batches adjacent texts."""
+    """Consumes durable tasks in strict arrival order."""
     while True:
         kind, payload = TASKS.get()
         WORKER_BUSY.set()
@@ -1978,23 +2179,16 @@ def worker_loop():
                 elif payload == "/usage":
                     handle_usage()
             else:
-                # batch any other texts already waiting
-                texts = [payload]
-                while True:
-                    try:
-                        k2, p2 = TASKS.get_nowait()
-                    except queue.Empty:
-                        break
-                    if k2 == "msg":
-                        texts.append(p2)
-                    else:
-                        TASKS.put((k2, p2))
-                        break
-                combined = "\n\n".join(texts)
+                # Preserve FIFO command barriers; moving a command back to the
+                # tail sends later messages into the session preceding /new.
+                combined = payload
                 state["pending"] = combined
                 save_json(STATE_PATH, state)
                 try:
-                    handle_message(combined)
+                    if isinstance(combined, dict):
+                        handle_message(combined["text"], session_id=combined["session_id"])
+                    else:
+                        handle_message(combined)
                 except Exception as e:  # noqa: BLE001
                     log("message error: %s" % e)
                     send_text("something broke on my end: %s"
@@ -2004,68 +2198,136 @@ def worker_loop():
         except Exception as e:  # noqa: BLE001
             log("worker error: %s" % e)
         finally:
+            TASKS.task_done()
             if TASKS.empty():
                 WORKER_BUSY.clear()
                 QUEUED_NOTE_SENT.clear()
 
 
-def _reap_stale_exec(session_id):
-    """Kill any leftover 'aside exec --session <sid>' process still
-    running from before this restart.
-
-    Without this, a restart while a turn is still mid-flight (crash,
-    KeepAlive relaunch, an operator running bridgemon/kickstart while
-    busy, etc.) leaves the old CLI subprocess orphaned and running,
-    while startup's pending-message recovery below queues a *second*
-    run of the exact same message. Both then drive (or silently
-    view) the same session concurrently, each with its own
-    TurnStream -- which is what produced the multiple broken/reset
-    'working...' status bubbles and stray unfolded narration bubbles
-    seen in practice. Reaping first guarantees a single owner before
-    any recovery re-queue happens.
-    """
-    if not session_id:
+def process_update(u):
+    """Dispatch one update; return only after its work has been retained."""
+    if u.get("callback_query"):
+        try:
+            handle_callback(u["callback_query"])
+        except Exception as e:  # noqa: BLE001
+            log("callback error: %s" % e)
+            raise
         return
-    try:
-        out = subprocess.run(
-            ["pgrep", "-f", "aside exec --session %s " % session_id],
-            capture_output=True, text=True)
-        pids = [p for p in out.stdout.split() if p.isdigit()]
-        for pid in pids:
-            if int(pid) == os.getpid():
-                continue
-            log("reaping stale exec pid=%s for session=%s (leftover "
-                "from a restart mid-turn)" % (pid, session_id))
+    m = u.get("message") or {}
+    if (m.get("chat") or {}).get("id") != CHAT_ID:
+        if m:
+            log("ignored message from chat %s"
+                % (m.get("chat") or {}).get("id"))
+        return
+
+    t = m.get("text")
+    if not t and m.get("photo"):
+        path = download_photo(m)
+        if path:
+            caption = m.get("caption") or ""
+            t = ("[%s sent an image from their phone, saved to "
+                 "%s -- open and look at it]%s"
+                 % (OWNER, path,
+                    (" " + caption) if caption else ""))
+            log("PHOTO saved: %s" % path)
+        else:
+            send_text("couldn't grab that image, try again?")
+            return
+    elif not t:
+        send_text("can't read that kind of message yet -- "
+                  "text and photos only")
+        return
+
+    if t.startswith("/"):
+        log("CMD %s" % t.split()[0])
+        try:
+            handle_command(t)
+        except Exception as e:  # noqa: BLE001
+            log("command error: %s" % e)
+            send_text("command blew up: %s" % str(e)[:200])
+            raise
+    else:
+        log("MSG in: %s%s" % (t[:120].replace("\n", " "),
+                              "..." if len(t) > 120 else ""))
+        TASKS.put(("msg", t))
+        if WORKER_BUSY.is_set() and \
+                not QUEUED_NOTE_SENT.is_set():
+            QUEUED_NOTE_SENT.set()
+            log("queued-notice sent (worker busy on arrival)")
+            tg_send_status(
+                "\U0001f4e5 got it -- i'm mid-task, "
+                "queued for right after")
+
+MAX_UPDATE_ATTEMPTS = 3
+UPDATE_FAILURES = {}
+
+
+def dispatch_updates(updates):
+    """Process updates in order without letting one bad update stop the bridge.
+
+    A failing update is retried from the same offset (so order is kept). After
+    MAX_UPDATE_ATTEMPTS it is skipped and the user is told, because otherwise
+    the process would exit, restart, fetch the same update and fail forever.
+    """
+    for u in updates:
+        uid = u["update_id"]
+        INCOMING.update_id = uid
+        try:
             try:
-                os.kill(int(pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        if pids:
-            time.sleep(1)
-    except Exception as e:  # noqa: BLE001
-        log("stale-exec reap check failed: %s" % e)
+                process_update(u)
+            except Exception as exc:  # noqa: BLE001
+                attempts = UPDATE_FAILURES.get(uid, 0) + 1
+                UPDATE_FAILURES[uid] = attempts
+                log("update %s failed (attempt %d/%d): %s"
+                    % (uid, attempts, MAX_UPDATE_ATTEMPTS, exc))
+                if attempts < MAX_UPDATE_ATTEMPTS:
+                    time.sleep(min(2 * attempts, 10))
+                    return  # poll again from the same offset
+                log("skipping update %s after %d failed attempts"
+                    % (uid, attempts))
+                try:
+                    send_text("I could not process one of your messages and "
+                              "skipped it. Please send it again.")
+                except Exception:  # noqa: BLE001
+                    pass
+            UPDATE_FAILURES.pop(uid, None)
+            state["offset"] = uid + 1
+            save_json(STATE_PATH, state)
+        finally:
+            INCOMING.update_id = None
 
 
 def main():
     log("bridge starting. session=%s model=%s owner=%s"
         % (state["session_id"], state["model"], OWNER))
-    _reap_stale_exec(state.get("session_id"))
-    # recover a message that was received but not fully processed
-    if state.get("pending"):
-        log("recovering pending message")
-        TASKS.put(("msg", state["pending"]))
+    # Execution can have changed external state before a crash. Retain the
+    # interrupted task for inspection, never silently execute it a second time.
+    interrupted = state.get("active_task")
+    if not interrupted and state.get("pending"):
+        interrupted = ["msg", state["pending"]]
+    if interrupted:
+        state.setdefault("interrupted_tasks", []).append(interrupted)
+        state["active_task"] = None
         state["pending"] = None
         save_json(STATE_PATH, state)
-
-    threading.Thread(target=worker_loop, daemon=True).start()
+        log("retained interrupted task; automatic replay disabled")
+        send_text("the bridge restarted during a task. I saved it but haven't "
+                  "repeated it, because some actions may already have happened. "
+                  "Review the session before sending it again.")
 
     # first run ever: no session yet -- create and persona-prime one
     if not state.get("session_id"):
         log("no session configured, creating one")
         TASKS.put(("cmd", "/new"))
 
+    worker = threading.Thread(target=worker_loop, daemon=True)
+    worker.start()
+    threading.Thread(target=outbox_loop, daemon=True).start()
+
     backoff = 1
     while True:
+        if not worker.is_alive():
+            raise RuntimeError("task worker stopped; restart required to recover queued work")
         try:
             res = tg("getUpdates", {
                 "offset": state["offset"],
@@ -2089,59 +2351,7 @@ def main():
         if not updates:
             continue
 
-        state["offset"] = updates[-1]["update_id"] + 1
-        save_json(STATE_PATH, state)
-
-        for u in updates:
-            if u.get("callback_query"):
-                try:
-                    handle_callback(u["callback_query"])
-                except Exception as e:  # noqa: BLE001
-                    log("callback error: %s" % e)
-                continue
-            m = u.get("message") or {}
-            if (m.get("chat") or {}).get("id") != CHAT_ID:
-                if m:
-                    log("ignored message from chat %s"
-                        % (m.get("chat") or {}).get("id"))
-                continue
-
-            t = m.get("text")
-            if not t and m.get("photo"):
-                path = download_photo(m)
-                if path:
-                    caption = m.get("caption") or ""
-                    t = ("[%s sent an image from their phone, saved to "
-                         "%s -- open and look at it]%s"
-                         % (OWNER, path,
-                            (" " + caption) if caption else ""))
-                    log("PHOTO saved: %s" % path)
-                else:
-                    send_text("couldn't grab that image, try again?")
-                    continue
-            elif not t:
-                send_text("can't read that kind of message yet -- "
-                          "text and photos only")
-                continue
-
-            if t.startswith("/"):
-                log("CMD %s" % t.split()[0])
-                try:
-                    handle_command(t)
-                except Exception as e:  # noqa: BLE001
-                    log("command error: %s" % e)
-                    send_text("command blew up: %s" % str(e)[:200])
-            else:
-                log("MSG in: %s%s" % (t[:120].replace("\n", " "),
-                                      "..." if len(t) > 120 else ""))
-                TASKS.put(("msg", t))
-                if WORKER_BUSY.is_set() and \
-                        not QUEUED_NOTE_SENT.is_set():
-                    QUEUED_NOTE_SENT.set()
-                    log("queued-notice sent (worker busy on arrival)")
-                    tg_send_status(
-                        "\U0001f4e5 got it -- i'm mid-task, "
-                        "queued for right after")
+        dispatch_updates(updates)
 
 
 if __name__ == "__main__":

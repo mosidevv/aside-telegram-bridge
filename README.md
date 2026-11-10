@@ -53,7 +53,10 @@ aside: Drafted a reply. Want to see it before I send?
   "subagent_wait" tool call. The full history (spawn -> wait -> result
   per subagent) is preserved in the tap-to-expand worklog too.
 - Send a photo and the agent opens and looks at it.
-- Messages sent mid-task queue politely and run next.
+- Messages sent mid-task are saved to disk and run in arrival order. Commands
+  such as `/new` stay between the messages that preceded and followed them.
+- Plain-text replies stay in a persistent outbox until Telegram accepts them;
+  temporary network failures no longer discard the answer after three tries.
 - Decisions come back as buttons. An action with side effects asks for
   Approve/Deny; a real choice comes as a question with one button per
   option. The agent is told never to use Aside's native question tools,
@@ -175,8 +178,13 @@ To stop everything: `bridgemon watch --kill` and `bridgemon miniapp stop`.
   things unattended -- understand what that means on your machine. Switch
   the grant to `guard` in `bridge.py` if you want confirmation-gated
   behavior.
-- Kill switch always works, and messages sent while the bridge is down are
-  recovered on restart.
+- Waiting tasks survive a restart. A task interrupted during execution is
+  retained for review instead of being automatically run again, since it may
+  already have performed actions. `/status` reports interrupted tasks and
+  replies awaiting delivery.
+- Text delivery retries are at least once: if Telegram accepted a message but
+  its HTTP response was lost, a retry can produce a duplicate. Photo sends and
+  live status edits do not use the persistent text outbox.
 
 <details>
 <summary><b>Architecture</b> (for the curious)</summary>
