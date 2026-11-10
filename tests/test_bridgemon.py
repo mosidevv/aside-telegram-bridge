@@ -529,7 +529,7 @@ class DeploymentHealthTests(_BridgemonFixture):
         config["token"] = "SECRET-TOKEN-DO-NOT-PRINT"
         self.write(self.bm.config_path(), json.dumps(config))
 
-        def telegram(token, method, timeout=15):
+        def telegram(token, method, params=None, timeout=15):
             if method == "getChatMenuButton":
                 return {"ok": True, "result": {"type": "web_app", "web_app": {
                     "url": "https://live.trycloudflare.com/"}}}
@@ -560,7 +560,7 @@ class DeploymentHealthTests(_BridgemonFixture):
         self.assertEqual(checks["model_usable"]["detail"], "expired")
 
     def test_live_check_errors_never_leak_the_token(self):
-        def boom(token, method, timeout=15):
+        def boom(token, method, params=None, timeout=15):
             raise RuntimeError("https://api.telegram.org/bot%s/x" % token)
         checks = self._live(telegram=boom)
         self.assertNotIn("SECRET-TOKEN", json.dumps(checks))

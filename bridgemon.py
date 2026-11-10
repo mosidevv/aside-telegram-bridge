@@ -704,19 +704,23 @@ def _repository_diagnosis():
     return repository
 
 
-def _telegram_call(token, method, timeout=15):
+def _telegram_call(token, method, params=None, timeout=15):
     """One Bot API call. The token only ever appears in the request URL."""
     req = urllib.request.Request(
         "https://api.telegram.org/bot%s/%s" % (token, method),
-        data=b"{}", headers={"content-type": "application/json"})
+        data=json.dumps(params or {}).encode(),
+        headers={"content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
 def _public_health_ok(url, timeout=10):
     """True if <url>/api/health answers ok when reached from outside."""
-    with urllib.request.urlopen(
-            url.rstrip("/") + "/api/health", timeout=timeout) as resp:
+    # Cloudflare's bot protection rejects Python's default User-Agent.
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/health",
+        headers={"User-Agent": "bridgemon-doctor/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return bool(json.load(resp).get("ok"))
 
 
@@ -788,7 +792,10 @@ def live_checks(telegram=_telegram_call, public_ok=_public_health_ok,
         except Exception as exc:  # noqa: BLE001
             record("tunnel_reachable", False, failure(exc))
         try:
-            result = telegram(token, "getChatMenuButton") if token else {}
+            chat_id = read_config().get("chat_id")
+            result = (telegram(token, "getChatMenuButton",
+                               {"chat_id": chat_id} if chat_id else None)
+                      if token else {})
             menu = ((result.get("result") or {}).get("web_app") or {}).get("url")
             same = bool(menu) and menu.rstrip("/") == url.rstrip("/")
             record("menu_button_matches_tunnel", same,
