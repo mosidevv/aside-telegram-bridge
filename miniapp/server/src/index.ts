@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildServer } from './app.js';
 import { loadConfig, loadOrCreateJwtSecret } from './config.js';
-import { Tunnel, defaultBinDir, registerMenuButton } from './tunnel.js';
+import { Tunnel, defaultBinDir, keepMenuButtonCurrent } from './tunnel.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -20,6 +20,7 @@ async function main(): Promise<void> {
   // hostname: a quick tunnel rotates it while we run, so anything captured
   // at boot goes stale.
   let tunnel: Tunnel | null = null;
+  let menuKeeper: ReturnType<typeof keepMenuButtonCurrent> | null = null;
 
   const { app } = await buildServer(config, {
     webDist,
@@ -52,17 +53,14 @@ async function main(): Promise<void> {
           );
           return;
         }
-        // Re-runs on every hostname rotation, which is what keeps an
-        // ephemeral quick-tunnel usable as a menu button target.
-        registerMenuButton(config.botToken, url).then(
-          (res) =>
-            app.log.info(
-              res.ok
-                ? 'menu button registered'
-                : `menu button rejected: ${res.description}`,
-            ),
-          (err) => app.log.error(`menu button failed: ${err.message}`),
-        );
+        // Runs on every hostname rotation and, via the keeper's timer,
+        // keeps checking that Telegram still points at the live tunnel.
+        menuKeeper ??= keepMenuButtonCurrent({
+          botToken: config.botToken,
+          getUrl: () => tunnel?.url ?? null,
+          log: (message) => app.log.info(message),
+        });
+        void menuKeeper.sync();
       },
     });
     tunnel.start().catch((err) => {
@@ -72,6 +70,7 @@ async function main(): Promise<void> {
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
+      menuKeeper?.stop();
       tunnel?.stop();
       app.close().then(
         () => process.exit(0),

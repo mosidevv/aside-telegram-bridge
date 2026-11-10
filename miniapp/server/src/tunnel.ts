@@ -415,6 +415,118 @@ export async function registerMenuButton(
   return { ok: Boolean(body?.ok), description: body?.description };
 }
 
+/** Telegram stores the menu URL with a trailing slash; compare without it. */
+function sameUrl(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  return a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
+}
+
+/** The URL the bot's default menu button currently opens, or null. */
+export async function getMenuButtonUrl(
+  botToken: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<string | null> {
+  const res = await fetchFn(
+    `https://api.telegram.org/bot${botToken}/getChatMenuButton`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    },
+  );
+  const body = (await res.json()) as {
+    ok?: boolean;
+    result?: { type?: string; web_app?: { url?: string } };
+  };
+  if (!body?.ok || body.result?.type !== 'web_app') return null;
+  return body.result.web_app?.url ?? null;
+}
+
+export interface MenuKeeperOptions {
+  botToken: string;
+  /** The tunnel's CURRENT url (it rotates), or null while it is down. */
+  getUrl: () => string | null;
+  log: (message: string) => void;
+  fetchFn?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+  /** How often to re-check that Telegram still points at the live tunnel. */
+  intervalMs?: number;
+  /** Waits between attempts inside one sync; its length caps the attempts. */
+  retryDelaysMs?: number[];
+}
+
+export interface MenuKeeper {
+  /** Run one sync now (used when the tunnel announces a new hostname). */
+  sync: () => Promise<boolean>;
+  stop: () => void;
+}
+
+/**
+ * Keep the Telegram menu button pointed at the live tunnel.
+ *
+ * Registering once at boot is not enough: if that single call fails (the
+ * network is still coming back after a restart, Telegram is briefly down)
+ * the phone keeps opening a dead hostname and nothing says so. This retries
+ * with backoff and then re-checks on a timer, so a failure heals itself.
+ */
+export function keepMenuButtonCurrent(opts: MenuKeeperOptions): MenuKeeper {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const delays = opts.retryDelaysMs ?? [2_000, 5_000, 15_000, 30_000, 60_000];
+  let running: Promise<boolean> | null = null;
+  let stopped = false;
+
+  const attemptOnce = async (url: string): Promise<boolean> => {
+    const current = await getMenuButtonUrl(opts.botToken, fetchFn);
+    if (sameUrl(current, url)) return true;
+    const res = await registerMenuButton(opts.botToken, url, fetchFn);
+    if (!res.ok) throw new Error(res.description || 'Telegram rejected the menu button');
+    opts.log('menu button registered');
+    return true;
+  };
+
+  const run = async (): Promise<boolean> => {
+    for (let attempt = 0; ; attempt++) {
+      if (stopped) return false;
+      const url = opts.getUrl();
+      if (!url) return false; // tunnel down; the next sync will pick it up
+      try {
+        return await attemptOnce(url);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (attempt >= delays.length) {
+          opts.log(`menu button still not registered, will retry later: ${message}`);
+          return false;
+        }
+        opts.log(`menu button attempt ${attempt + 1} failed: ${message}`);
+        await sleep(delays[attempt]);
+      }
+    }
+  };
+
+  const sync = (): Promise<boolean> => {
+    // Never run two syncs at once; a second caller shares the first result.
+    if (!running) {
+      running = run().finally(() => {
+        running = null;
+      });
+    }
+    return running;
+  };
+
+  const timer = setInterval(() => void sync(), opts.intervalMs ?? 5 * 60_000);
+  timer.unref?.();
+
+  return {
+    sync,
+    stop: () => {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
 /** Trim a log file that has grown past `maxBytes`, keeping the tail. */
 export function rotateLog(logPath: string, maxBytes: number): void {
   try {

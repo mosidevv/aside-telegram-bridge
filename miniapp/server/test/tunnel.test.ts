@@ -20,6 +20,7 @@ import {
   parseTunnelUrl,
   pinnedRelease,
   registerMenuButton,
+  keepMenuButtonCurrent,
   rotateLog,
   sha256File,
   userSuppliedCloudflared,
@@ -403,5 +404,87 @@ describe('rotateLog', () => {
 
   it('is a no-op for a missing file', () => {
     expect(() => rotateLog('/nope/none.log', 10)).not.toThrow();
+  });
+});
+
+/**
+ * The menu button must heal itself: a single failed registration at boot used
+ * to leave the phone opening a dead hostname with no retry and no alert.
+ * Telegram is faked, so nothing here reaches the network.
+ */
+describe('keepMenuButtonCurrent', () => {
+  function fakeTelegram(opts: { current: string | null; failSetTimes?: number }) {
+    const state = { current: opts.current, sets: 0, gets: 0, failLeft: opts.failSetTimes ?? 0 };
+    const fetchFn = (async (url: string, init: any) => {
+      if (url.endsWith('/getChatMenuButton')) {
+        state.gets++;
+        return {
+          json: async () => ({
+            ok: true,
+            result: state.current
+              ? { type: 'web_app', web_app: { url: state.current } }
+              : { type: 'default' },
+          }),
+        };
+      }
+      if (state.failLeft > 0) {
+        state.failLeft--;
+        throw new TypeError('fetch failed');
+      }
+      state.sets++;
+      state.current = JSON.parse(init.body).menu_button.web_app.url + '/';
+      return { json: async () => ({ ok: true }) };
+    }) as unknown as typeof fetch;
+    return { state, fetchFn };
+  }
+
+  const make = (tg: ReturnType<typeof fakeTelegram>, url: string | null) => {
+    const logs: string[] = [];
+    const keeper = keepMenuButtonCurrent({
+      botToken: 'TOKEN',
+      getUrl: () => url,
+      log: (m) => logs.push(m),
+      fetchFn: tg.fetchFn,
+      sleep: async () => {},
+      intervalMs: 3_600_000,
+    });
+    return { keeper, logs };
+  };
+
+  it('retries after a failed registration instead of giving up', async () => {
+    const tg = fakeTelegram({ current: 'https://old.trycloudflare.com/', failSetTimes: 2 });
+    const { keeper, logs } = make(tg, 'https://new.trycloudflare.com');
+    expect(await keeper.sync()).toBe(true);
+    expect(tg.state.sets).toBe(1);
+    expect(tg.state.current).toBe('https://new.trycloudflare.com/');
+    expect(logs.filter((l) => l.includes('failed')).length).toBe(2);
+    keeper.stop();
+  });
+
+  it('does nothing when Telegram already points at the live tunnel', async () => {
+    const tg = fakeTelegram({ current: 'https://same.trycloudflare.com/' });
+    const { keeper } = make(tg, 'https://same.trycloudflare.com');
+    expect(await keeper.sync()).toBe(true);
+    expect(tg.state.sets).toBe(0);
+    keeper.stop();
+  });
+
+  it('gives up after the retry budget and can recover on the next sync', async () => {
+    const tg = fakeTelegram({ current: null, failSetTimes: 99 });
+    const { keeper, logs } = make(tg, 'https://x.trycloudflare.com');
+    expect(await keeper.sync()).toBe(false);
+    expect(logs.some((l) => l.includes('will retry later'))).toBe(true);
+    tg.state.failLeft = 0;
+    expect(await keeper.sync()).toBe(true);
+    expect(tg.state.sets).toBe(1);
+    keeper.stop();
+  });
+
+  it('skips quietly while the tunnel has no hostname', async () => {
+    const tg = fakeTelegram({ current: null });
+    const { keeper } = make(tg, null);
+    expect(await keeper.sync()).toBe(false);
+    expect(tg.state.gets + tg.state.sets).toBe(0);
+    keeper.stop();
   });
 });
