@@ -522,6 +522,50 @@ class DeploymentHealthTests(_BridgemonFixture):
         self.assertNotIn("config", payload)
         self.assertNotIn("environment", payload)
 
+    def _live(self, **over):
+        self.write_config({"state_dir": self.root, "port": 8790})
+        with open(self.bm.config_path(), encoding="utf-8") as handle:
+            config = json.load(handle)
+        config["token"] = "SECRET-TOKEN-DO-NOT-PRINT"
+        self.write(self.bm.config_path(), json.dumps(config))
+
+        def telegram(token, method, timeout=15):
+            if method == "getChatMenuButton":
+                return {"ok": True, "result": {"type": "web_app", "web_app": {
+                    "url": "https://live.trycloudflare.com/"}}}
+            return {"ok": True}
+        kwargs = dict(
+            telegram=telegram, public_ok=lambda url: True,
+            probe=lambda: (True, "ok"),
+            public_url=lambda: "https://live.trycloudflare.com")
+        kwargs.update(over)
+        return self.bm.live_checks(**kwargs)
+
+    def test_live_checks_all_pass_when_everything_matches(self):
+        checks = self._live()
+        self.assertTrue(all(c["ok"] for c in checks.values()), checks)
+        self.assertEqual(set(checks), {
+            "telegram_api", "tunnel_reachable",
+            "menu_button_matches_tunnel", "model_usable"})
+
+    def test_live_checks_catch_stale_menu_button(self):
+        checks = self._live(public_url=lambda: "https://other.trycloudflare.com")
+        self.assertFalse(checks["menu_button_matches_tunnel"]["ok"])
+
+    def test_live_checks_catch_unreachable_tunnel_and_dead_model(self):
+        def down(url):
+            raise OSError("no route")
+        checks = self._live(public_ok=down, probe=lambda: (False, "expired"))
+        self.assertFalse(checks["tunnel_reachable"]["ok"])
+        self.assertEqual(checks["model_usable"]["detail"], "expired")
+
+    def test_live_check_errors_never_leak_the_token(self):
+        def boom(token, method, timeout=15):
+            raise RuntimeError("https://api.telegram.org/bot%s/x" % token)
+        checks = self._live(telegram=boom)
+        self.assertNotIn("SECRET-TOKEN", json.dumps(checks))
+        self.assertFalse(checks["telegram_api"]["ok"])
+
     def test_current_plist_paths_can_make_product_ready(self):
         self.write(self.bm.BRIDGE_PY, "print('safe')\n")
         self.write(os.path.join(self.root, "aside_session.py"), "VALUE = 1\n")

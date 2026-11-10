@@ -5,6 +5,8 @@ Deploy tooling:
   bridgemon status          both services: launchd state, pid, port,
                              tunnel URL, last log lines
   bridgemon doctor [--json] bounded source/install/process/endpoint evidence
+  bridgemon doctor --live   also test Telegram, the tunnel from outside, the
+                             menu button and the selected model for real
   bridgemon update          fast-forward the configured upstream, then
                              syntax-check, restart, and health-check
   bridgemon rollback        show recovery material without overwriting source
@@ -702,6 +704,107 @@ def _repository_diagnosis():
     return repository
 
 
+def _telegram_call(token, method, timeout=15):
+    """One Bot API call. The token only ever appears in the request URL."""
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot%s/%s" % (token, method),
+        data=b"{}", headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def _public_health_ok(url, timeout=10):
+    """True if <url>/api/health answers ok when reached from outside."""
+    with urllib.request.urlopen(
+            url.rstrip("/") + "/api/health", timeout=timeout) as resp:
+        return bool(json.load(resp).get("ok"))
+
+
+def _probe_selected_model():
+    """(usable, reason) for the model /new would use. Sends one tiny request."""
+    sys.path.insert(0, BRIDGE_DIR)
+    import aside_session
+    config = read_config()
+    with open(os.path.join(BRIDGE_DIR, "state.json")) as fh:
+        selection = json.load(fh).get("model") or config.get("default_model")
+    credentials = os.path.expanduser(
+        config.get("credentials_path") or "~/.aside/u/0/credentials.json")
+    resolved = aside_session.resolve_model(
+        selection, aside_session.merge_model_ids(config),
+        aside_session.read_connected_providers(credentials))
+    cli = os.path.expanduser(config.get("aside_cli") or "aside")
+    return aside_session.probe_model(cli, resolved.qualified_model)
+
+
+def _tunnel_public_url():
+    """The live public URL: an explicit config value, else the log's newest."""
+    section = miniapp_section()
+    if section.get("tunnel") != "cloudflared" and not section.get("public_url"):
+        return None
+    if section.get("public_url"):
+        return str(section["public_url"])
+    lines = []
+    for path in miniapp_logs(section):
+        lines.extend(tail(path, 200))
+    return parse_tunnel_url(lines)
+
+
+def live_checks(telegram=_telegram_call, public_ok=_public_health_ok,
+                probe=_probe_selected_model, public_url=_tunnel_public_url):
+    """Real end-to-end checks. Each is {"ok": bool, "detail": str}.
+
+    Details never include the bot token or any URL that contains it: only
+    exception class names and HTTP status codes are reported.
+    """
+    checks = {}
+
+    def record(name, ok, detail=""):
+        checks[name] = {"ok": bool(ok), "detail": detail}
+
+    def failure(exc):
+        code = getattr(exc, "code", None)
+        return "%s%s" % (type(exc).__name__, " %s" % code if code else "")
+
+    token = read_config().get("token")
+    if not token:
+        record("telegram_api", False, "no bot token in config")
+    else:
+        try:
+            me = telegram(token, "getMe")
+            record("telegram_api", me.get("ok"),
+                   "" if me.get("ok") else "Telegram rejected getMe")
+        except Exception as exc:  # noqa: BLE001
+            record("telegram_api", False, failure(exc))
+
+    url = public_url()
+    if not url:
+        record("tunnel_reachable", True, "skipped: no public tunnel configured")
+        record("menu_button_matches_tunnel", True, "skipped: no public tunnel")
+    else:
+        try:
+            ok = public_ok(url)
+            record("tunnel_reachable", ok,
+                   "" if ok else "health endpoint answered but not ok")
+        except Exception as exc:  # noqa: BLE001
+            record("tunnel_reachable", False, failure(exc))
+        try:
+            result = telegram(token, "getChatMenuButton") if token else {}
+            menu = ((result.get("result") or {}).get("web_app") or {}).get("url")
+            same = bool(menu) and menu.rstrip("/") == url.rstrip("/")
+            record("menu_button_matches_tunnel", same,
+                   "" if same else "the phone's menu button points at a "
+                   "different address than the live tunnel")
+        except Exception as exc:  # noqa: BLE001
+            record("menu_button_matches_tunnel", False, failure(exc))
+
+    try:
+        usable, reason = probe()
+        record("model_usable", usable, "" if usable else reason)
+    except Exception as exc:  # noqa: BLE001
+        record("model_usable", False, failure(exc))
+    return checks
+
+
 def cmd_doctor(args):
     """Emit bounded deployment evidence without configs, logs, or secrets."""
 
@@ -730,6 +833,10 @@ def cmd_doctor(args):
         "product_ready": health.product_ready,
         "reasons": list(health.reasons),
     }
+    live_ok = True
+    if "--live" in args:
+        payload["live"] = live_checks()
+        live_ok = all(c["ok"] for c in payload["live"].values())
     if "--json" in args:
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -737,7 +844,11 @@ def cmd_doctor(args):
         print("repository: %s" % payload["repository"]["root"])
         for reason in payload["reasons"]:
             print("  - %s" % reason)
-    return 0 if health.product_ready else 1
+        for name, check in payload.get("live", {}).items():
+            print("  %s %s%s" % ("ok  " if check["ok"] else "FAIL", name,
+                                 (": " + check["detail"]) if check["detail"]
+                                 else ""))
+    return 0 if health.product_ready and live_ok else 1
 
 
 def _int_arg(args, default):
