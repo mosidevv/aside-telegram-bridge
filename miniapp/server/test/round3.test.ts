@@ -272,8 +272,9 @@ describe('sending with attachments', () => {
         'what do you make of these',
     );
     // The rest of the invocation is unchanged.
-    expect(argv).toContain('exec');
-    expect(argv).toContain('--session');
+    expect(argv).toContain('session');
+    expect(argv).toContain('resume');
+    expect(argv).not.toContain('--session');
     expect(argv).toContain('fixtureAAAA');
   });
 
